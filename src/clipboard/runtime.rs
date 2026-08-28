@@ -1,8 +1,13 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::io::{BufRead as _, Write as _};
+
+use sha2::{Digest as _, Sha256};
 
 use windows::Win32::Foundation::{
     CLIPBRD_E_CANT_OPEN, E_INVALIDARG, E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, S_OK, WPARAM,
@@ -33,9 +38,14 @@ use super::loopback::{
     LoopbackServer, LoopbackServerConfig, TcpRangeSource,
 };
 use super::probe::ProbeState;
+use super::secure_transfer::{
+    RemoteTransferRegistry, SecureMetricsSnapshot, SecureOfferClient, SecureOfferServer,
+    SecureOfferedFile, SecureRemoteSource, TransferStatus,
+};
 use super::source::{MemorySource, ReadAtSource};
 use super::transfer::{GeneratedSource, TransferControl};
 use super::{TEST_FILE_CONTENT, TEST_FILE_NAME};
+use crate::security::PinnedTlsServer;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClipboardProbeOptions {
@@ -68,6 +78,34 @@ pub struct FileCaptureProbeOptions {
     pub offer_ttl: Duration,
     pub lifetime: Option<Duration>,
     pub async_mode: bool,
+}
+
+pub struct SecureSourceProbeOptions {
+    pub listen_address: SocketAddr,
+    pub source_path: PathBuf,
+    pub offer_ttl: Duration,
+    pub transfer_ttl: Duration,
+    pub io_timeout: Duration,
+    pub lifetime: Option<Duration>,
+    pub tls: PinnedTlsServer,
+}
+
+pub struct SecureReceiverProbeOptions {
+    pub client: SecureOfferClient,
+    pub lifetime: Option<Duration>,
+    pub async_mode: bool,
+}
+
+pub struct SecureFetchProbeOptions {
+    pub client: SecureOfferClient,
+    pub output_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecureFetchResult {
+    pub bytes: u64,
+    pub sha256: [u8; 32],
+    pub status: TransferStatus,
 }
 
 pub const PAUSE_TEST_FILE_NAME: &str = "RemoteClipboard-Pause-Test.bin";
@@ -725,6 +763,451 @@ pub fn run_loopback_probe(options: LoopbackProbeOptions) -> Result<()> {
         lease.probe.dropped_events()
     );
     Ok(())
+}
+
+/// Serves one captured local file through the stage-4 pinned mutual-TLS protocol.
+///
+/// # Errors
+///
+/// Returns an I/O, source validation, TLS, protocol, or worker-start error.
+pub fn run_secure_source_probe(options: SecureSourceProbeOptions) -> std::io::Result<()> {
+    let snapshot = FileSnapshot::capture(&options.source_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let mut registry = LocalOfferRegistry::default();
+    let local_offer = registry
+        .publish(snapshot, options.offer_ttl)
+        .map_err(windows_to_io)?;
+    let offered = SecureOfferedFile::from_local_offer(&local_offer)?;
+    let mut server = SecureOfferServer::start(
+        options.listen_address,
+        options.tls,
+        offered,
+        options.transfer_ttl,
+        options.io_timeout,
+    )?;
+    let manifest = server.manifest();
+    println!(
+        "READY mode=secure-source tls=1.3 mtls=true address={} offer={} file_id={} file={} size={} content_reads=0 lifetime={}",
+        server.address(),
+        manifest.offer_id,
+        manifest.file_id,
+        manifest.descriptor.file_name,
+        manifest.descriptor.size,
+        options.lifetime.map_or_else(
+            || "infinite".to_owned(),
+            |duration| format!("{}s", duration.as_secs())
+        )
+    );
+    println!("CONTROL commands=status,quit");
+    let _ = std::io::stdout().flush();
+
+    wait_for_secure_source_control(&server, options.lifetime)?;
+    server.stop();
+    print_secure_server_stop(server.metrics());
+    Ok(())
+}
+
+/// Downloads one authenticated offer through the same range protocol used by the virtual stream.
+/// The target is published by rename only after completion, so failures leave no final file.
+///
+/// # Errors
+///
+/// Returns an I/O, TLS, protocol, source, or destination error.
+pub fn run_secure_fetch_probe(
+    options: SecureFetchProbeOptions,
+) -> std::io::Result<SecureFetchResult> {
+    if options.output_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "secure fetch output already exists",
+        ));
+    }
+    let manifest = options.client.fetch_manifest()?;
+    let source = SecureRemoteSource::new(options.client, manifest.clone());
+    let temporary_path = unique_partial_path(&options.output_path)?;
+    let mut temporary = PartialFileGuard::create(temporary_path)?;
+    let mut offset = 0_u64;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let read = source.read_at(offset, &mut buffer).map_err(windows_to_io)?;
+        if read == 0 {
+            break;
+        }
+        temporary.file.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("download offset overflow"))?;
+    }
+    if offset != manifest.descriptor.size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "download size differs from authenticated manifest",
+        ));
+    }
+    let status = source.complete()?;
+    temporary.file.flush()?;
+    temporary.file.sync_all()?;
+    temporary.commit(&options.output_path)?;
+    Ok(SecureFetchResult {
+        bytes: offset,
+        sha256: digest.finalize().into(),
+        status,
+    })
+}
+
+/// Registers the authenticated remote manifest as a virtual file and lazily starts one secure
+/// transfer per `FILECONTENTS` stream.
+///
+/// # Errors
+///
+/// Returns a TLS, protocol, COM, clipboard, timer, or thread-start error.
+pub fn run_secure_receiver_probe(options: &SecureReceiverProbeOptions) -> Result<()> {
+    let manifest = options
+        .client
+        .fetch_manifest()
+        .map_err(io_to_windows_error)?;
+    let _apartment = OleApartment::initialize()?;
+    let window = ClipboardWindow::create()?;
+    let registry = Arc::new(RemoteTransferRegistry::default());
+    let source_factory = {
+        let client = options.client.clone();
+        let manifest = manifest.clone();
+        let registry = Arc::clone(&registry);
+        Arc::new(move || {
+            let source = registry.create_source(client.clone(), manifest.clone());
+            let source: Arc<dyn ReadAtSource> = source;
+            source
+        }) as Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>
+    };
+    let probe = Arc::new(ProbeState::quiet());
+    let object = VirtualFileDataObject::create_with_source_factory(
+        manifest.descriptor.clone(),
+        source_factory,
+        Arc::clone(&probe),
+        manifest.origin_payload(),
+    )?;
+    if options.async_mode {
+        let capability: IDataObjectAsyncCapability = object.cast()?;
+        unsafe { capability.SetAsyncMode(true) }?;
+    }
+    ole_set_clipboard_with_retry(&object)?;
+    let lease = RemoteClipboardLease {
+        object,
+        window,
+        probe,
+        registry: Arc::clone(&registry),
+    };
+    println!(
+        "READY mode=secure-receiver tls=1.3 mtls=true offer={} file_id={} file={} size={} content_reads=0 async_mode={} lifetime={}",
+        manifest.offer_id,
+        manifest.file_id,
+        manifest.descriptor.file_name,
+        manifest.descriptor.size,
+        options.async_mode,
+        options.lifetime.map_or_else(
+            || "infinite".to_owned(),
+            |duration| format!("{}s", duration.as_secs())
+        )
+    );
+    println!("CONTROL commands=pause,resume,cancel,status,quit");
+    let _ = std::io::stdout().flush();
+    let main_thread_id = unsafe { GetCurrentThreadId() };
+    spawn_secure_receiver_control(Arc::clone(&registry), main_thread_id)?;
+    let timer = options.lifetime.map(set_exit_timer).transpose()?;
+    remote_message_loop(timer, &lease)?;
+    if let Some(timer) = timer {
+        let _ = unsafe { KillTimer(None, timer) };
+    }
+    let current_status = lease.current_status();
+    let latest = registry.latest_started().ok();
+    let transfer_state = match latest.as_ref() {
+        None => "not-started".to_owned(),
+        Some(source) => source.status().map_or_else(
+            |error| format!("unavailable({})", error.kind()),
+            |status| format!("{:?}", status.state),
+        ),
+    };
+    println!(
+        "STOP current_clipboard={} status={:#010X} live_sources={} read_calls={} bytes_read={} transfer_state={}",
+        current_status == S_OK,
+        current_status.0.cast_unsigned(),
+        registry.live_sources(),
+        latest.as_ref().map_or(0, |source| source.read_calls()),
+        latest.as_ref().map_or(0, |source| source.bytes_read()),
+        transfer_state
+    );
+    Ok(())
+}
+
+struct RemoteClipboardLease {
+    object: IDataObject,
+    window: ClipboardWindow,
+    probe: Arc<ProbeState>,
+    registry: Arc<RemoteTransferRegistry>,
+}
+
+impl RemoteClipboardLease {
+    fn current_status(&self) -> HRESULT {
+        unsafe { ole_is_current_clipboard_raw(Interface::as_raw(&self.object)) }
+    }
+}
+
+impl Drop for RemoteClipboardLease {
+    fn drop(&mut self) {
+        let status = self.current_status();
+        self.probe.record(
+            "RemoteClipboardLease::drop",
+            format_args!(
+                "was_current={} status={:#010X} live_sources={}",
+                status == S_OK,
+                status.0.cast_unsigned(),
+                self.registry.live_sources()
+            ),
+        );
+        if status == S_OK {
+            let _ = unsafe { OleSetClipboard(None::<&IDataObject>) };
+        }
+    }
+}
+
+fn remote_message_loop(exit_timer: Option<usize>, lease: &RemoteClipboardLease) -> Result<()> {
+    loop {
+        let mut message = MSG::default();
+        let status = unsafe { GetMessageW(&raw mut message, None, 0, 0) }.0;
+        if status == -1 {
+            return Err(Error::from_thread());
+        }
+        if status == 0 || message.message == WM_QUIT {
+            return Ok(());
+        }
+        if message.message == WM_TIMER && exit_timer == Some(message.wParam.0) {
+            return Ok(());
+        }
+        if message.hwnd == lease.window.handle && message.message == WM_CLIPBOARDUPDATE {
+            let status = lease.current_status();
+            lease.probe.record(
+                "WM_CLIPBOARDUPDATE",
+                format_args!(
+                    "current={} status={:#010X}",
+                    status == S_OK,
+                    status.0.cast_unsigned()
+                ),
+            );
+        }
+        unsafe {
+            let _ = TranslateMessage(&raw const message);
+            DispatchMessageW(&raw const message);
+        }
+    }
+}
+
+fn spawn_secure_receiver_control(
+    registry: Arc<RemoteTransferRegistry>,
+    main_thread_id: u32,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("clipferry-secure-control".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    eprintln!("CONTROL input_error=true");
+                    break;
+                };
+                let command = line.trim().to_ascii_lowercase();
+                if command == "quit" {
+                    if let Ok(source) = registry.latest_started() {
+                        let _ = source.cancel();
+                    }
+                    let _ = unsafe {
+                        PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                    };
+                    break;
+                }
+                let source = match registry.latest_started() {
+                    Ok(source) => source,
+                    Err(error) => {
+                        if !command.is_empty() {
+                            eprintln!("CONTROL state=not-started command={command} error={error}");
+                        }
+                        continue;
+                    }
+                };
+                let result = match command.as_str() {
+                    "pause" => source.pause(),
+                    "resume" => source.resume(),
+                    "cancel" => source.cancel(),
+                    "status" => source.status(),
+                    "" => continue,
+                    _ => {
+                        eprintln!("CONTROL unknown={command:?}");
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(status) => println!(
+                        "CONTROL state={:?} unique_bytes={} read_calls={} bytes_read={}",
+                        status.state,
+                        status.unique_bytes,
+                        source.read_calls(),
+                        source.bytes_read()
+                    ),
+                    Err(error) => eprintln!("CONTROL command={command} error={error}"),
+                }
+                let _ = std::io::stdout().flush();
+            }
+        })
+        .map_err(|_| Error::from_hresult(E_UNEXPECTED))?;
+    Ok(())
+}
+
+fn wait_for_secure_source_control(
+    server: &SecureOfferServer,
+    lifetime: Option<Duration>,
+) -> std::io::Result<()> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("clipferry-secure-source-control".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(line) => {
+                        if sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })?;
+    let deadline = lifetime.map(|duration| Instant::now() + duration);
+    loop {
+        let timeout = deadline.map_or(Duration::from_secs(1), |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1))
+        });
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(line) => match line.trim().to_ascii_lowercase().as_str() {
+                "status" => print_secure_server_status(server.metrics()),
+                "quit" => return Ok(()),
+                "" => {}
+                command => eprintln!("CONTROL unknown={command:?}"),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn print_secure_server_status(metrics: SecureMetricsSnapshot) {
+    print_secure_server_metrics("CONTROL", metrics);
+}
+
+fn print_secure_server_stop(metrics: SecureMetricsSnapshot) {
+    print_secure_server_metrics("STOP", metrics);
+}
+
+fn print_secure_server_metrics(prefix: &str, metrics: SecureMetricsSnapshot) {
+    println!(
+        "{prefix} tls_connections={} tls_failures={} begun_transfers={} network_reads={} served_bytes={} unique_bytes={} active_reads={} denied={} replays={} cancelled={} protocol_errors={}",
+        metrics.accepted_connections,
+        metrics.tls_failures,
+        metrics.begun_transfers,
+        metrics.read_requests,
+        metrics.served_bytes,
+        metrics.unique_bytes,
+        metrics.active_reads,
+        metrics.denied_requests,
+        metrics.replayed_requests,
+        metrics.cancelled_transfers,
+        metrics.protocol_errors
+    );
+}
+
+struct PartialFileGuard {
+    path: PathBuf,
+    file: std::fs::File,
+    committed: bool,
+}
+
+impl PartialFileGuard {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self, output_path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, output_path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PartialFileGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn unique_partial_path(output_path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("secure fetch output has no parent directory"))?;
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("secure fetch output has no file name"))?
+        .to_string_lossy();
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let suffix = nonce
+        .iter()
+        .fold(String::with_capacity(16), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+    Ok(parent.join(format!(".{file_name}.clipferry-{suffix}.part")))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn windows_to_io(error: Error) -> std::io::Error {
+    std::io::Error::other(format!(
+        "Windows error {:#010X}: {error}",
+        error.code().0.cast_unsigned()
+    ))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn io_to_windows_error(error: std::io::Error) -> Error {
+    use windows::Win32::Foundation::{
+        E_ACCESSDENIED, ERROR_CANCELLED, ERROR_READ_FAULT, ERROR_TIMEOUT,
+    };
+    let hresult = match error.kind() {
+        std::io::ErrorKind::Interrupted => HRESULT::from_win32(ERROR_CANCELLED.0),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            HRESULT::from_win32(ERROR_TIMEOUT.0)
+        }
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData => E_ACCESSDENIED,
+        std::io::ErrorKind::InvalidInput => E_INVALIDARG,
+        _ => HRESULT::from_win32(ERROR_READ_FAULT.0),
+    };
+    Error::from_hresult(hresult)
 }
 
 fn spawn_control_input(control: Arc<TransferControl>, main_thread_id: u32) -> Result<()> {

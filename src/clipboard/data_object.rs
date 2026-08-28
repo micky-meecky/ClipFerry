@@ -96,7 +96,7 @@ pub struct VirtualFileDataObject {
     formats: ClipboardFormats,
     descriptor: VirtualFileDescriptor,
     origin_payload: Arc<[u8]>,
-    source: Arc<dyn ReadAtSource>,
+    source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>,
     probe: Arc<ProbeState>,
     async_mode: AtomicBool,
     in_operation: AtomicBool,
@@ -147,17 +147,34 @@ impl VirtualFileDataObject {
         probe: Arc<ProbeState>,
         origin_payload: Arc<[u8]>,
     ) -> Result<IDataObject> {
-        if descriptor.size != source.len() || origin_payload.is_empty() {
+        if descriptor.size != source.len() {
             return Err(Error::from_hresult(
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
         }
+        let source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync> =
+            Arc::new(move || Arc::clone(&source));
+        Self::create_with_source_factory(descriptor, source_factory, probe, origin_payload)
+    }
+
+    pub(crate) fn create_with_source_factory(
+        descriptor: VirtualFileDescriptor,
+        source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>,
+        probe: Arc<ProbeState>,
+        origin_payload: Arc<[u8]>,
+    ) -> Result<IDataObject> {
+        if origin_payload.is_empty() {
+            return Err(Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+        validate_virtual_file_name(&descriptor.file_name)?;
         let formats = ClipboardFormats::register()?;
         let object: IDataObject = Self {
             formats,
             descriptor,
             origin_payload,
-            source,
+            source_factory,
             probe,
             async_mode: AtomicBool::new(false),
             in_operation: AtomicBool::new(false),
@@ -199,8 +216,14 @@ impl VirtualFileDataObject {
             return self.file_descriptor_medium();
         }
         if format.cfFormat == self.formats.contents {
+            let source = (self.source_factory)();
+            if source.len() != self.descriptor.size {
+                return Err(Error::from_hresult(
+                    windows::Win32::Foundation::E_UNEXPECTED,
+                ));
+            }
             let stream = VirtualStream::create(
-                Arc::clone(&self.source),
+                source,
                 Arc::clone(&self.descriptor.file_name),
                 0,
                 Arc::clone(&self.probe),

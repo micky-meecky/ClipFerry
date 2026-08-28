@@ -4,6 +4,7 @@ mod local_file;
 mod loopback;
 mod probe;
 mod runtime;
+pub mod secure_transfer;
 mod source;
 mod stream;
 mod transfer;
@@ -11,7 +12,9 @@ mod transfer;
 pub use probe::ProbeState;
 pub use runtime::{
     ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
-    run_clipboard_probe, run_file_capture_probe, run_loopback_probe, run_pause_probe,
+    SecureFetchProbeOptions, SecureFetchResult, SecureReceiverProbeOptions,
+    SecureSourceProbeOptions, run_clipboard_probe, run_file_capture_probe, run_loopback_probe,
+    run_pause_probe, run_secure_fetch_probe, run_secure_receiver_probe, run_secure_source_probe,
 };
 
 pub const TEST_FILE_NAME: &str = "RemoteClipboard-Test.txt";

@@ -1,4 +1,5 @@
 pub mod clipboard;
+pub mod security;
 
 pub const APP_NAME: &str = "ClipFerry";
 

@@ -1055,7 +1055,8 @@ mod tests {
         );
         assert_eq!(first[0], generated_byte(900));
         assert_eq!(second[0], generated_byte(500));
-        assert_eq!(server.metrics().unique_bytes, 64);
+        let metrics = wait_for_metrics(&server, |metrics| metrics.unique_bytes == 64);
+        assert_eq!(metrics.unique_bytes, 64);
     }
 
     #[test]
