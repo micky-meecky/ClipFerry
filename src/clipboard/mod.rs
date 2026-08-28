@@ -1,0 +1,29 @@
+mod data_object;
+mod format_enum;
+mod probe;
+mod runtime;
+mod source;
+mod stream;
+
+pub use probe::ProbeState;
+pub use runtime::{ClipboardProbeOptions, run_clipboard_probe};
+
+pub const TEST_FILE_NAME: &str = "RemoteClipboard-Test.txt";
+pub const TEST_FILE_CONTENT: &[u8] = b"ClipFerry virtual file stream test.\r\n";
+
+pub(crate) fn catch_com_result<T>(
+    operation: impl FnOnce() -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_UNEXPECTED,
+        ))
+    })
+}
+
+pub(crate) fn catch_com_hresult(
+    operation: impl FnOnce() -> windows::core::HRESULT,
+) -> windows::core::HRESULT {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+        .unwrap_or(windows::Win32::Foundation::E_UNEXPECTED)
+}
