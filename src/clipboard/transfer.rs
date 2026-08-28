@@ -98,7 +98,7 @@ impl TransferControl {
         Ok(current)
     }
 
-    fn wait_for_chunk(&self, delay: Duration) -> Result<()> {
+    pub(crate) fn wait_for_chunk(&self, delay: Duration) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -127,7 +127,7 @@ impl TransferControl {
         }
     }
 
-    fn note_chunk(&self, bytes: usize) -> Result<()> {
+    pub(crate) fn note_chunk(&self, bytes: usize) -> Result<()> {
         let bytes = u64::try_from(bytes).map_err(|_| Error::from_hresult(E_UNEXPECTED))?;
         self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
         self.chunk_calls.fetch_add(1, Ordering::Relaxed);

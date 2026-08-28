@@ -2,7 +2,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clipferry::clipboard::{
-    ClipboardProbeOptions, PauseProbeOptions, run_clipboard_probe, run_pause_probe,
+    ClipboardProbeOptions, LoopbackProbeOptions, PauseProbeOptions, run_clipboard_probe,
+    run_loopback_probe, run_pause_probe,
 };
 
 fn main() -> ExitCode {
@@ -45,6 +46,11 @@ fn run() -> Result<(), String> {
             run_pause_probe(options)
                 .map_err(|error| format!("{error} ({:#010X})", error.code().0.cast_unsigned()))
         }
+        "loopback-clipboard-test" => {
+            let options = parse_loopback_probe_options(arguments)?;
+            run_loopback_probe(options)
+                .map_err(|error| format!("{error} ({:#010X})", error.code().0.cast_unsigned()))
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -59,6 +65,66 @@ fn print_usage() {
     println!(
         "  clipferry clipboard-pause-test [--size-mib <MiB>] [--chunk-kib <KiB>] [--delay-ms <ms>] [--async-mode] [--lifetime-seconds <seconds>]"
     );
+    println!(
+        "  clipferry loopback-clipboard-test [--size-mib <MiB>] [--range-kib <KiB>] [--fragment-bytes <bytes>] [--delay-ms <ms>] [--io-timeout-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
+    );
+}
+
+fn parse_loopback_probe_options(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<LoopbackProbeOptions, String> {
+    let mut size_mib = 64_u64;
+    let mut range_kib = 64_u64;
+    let mut fragment_bytes = 8 * 1024_u64;
+    let mut delay_ms = 1_u64;
+    let mut io_timeout_seconds = 30_u64;
+    let mut lifetime = None;
+    let mut async_mode = false;
+
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--async-mode" => async_mode = true,
+            "--size-mib" => size_mib = parse_value(&mut arguments, &argument)?,
+            "--range-kib" => range_kib = parse_value(&mut arguments, &argument)?,
+            "--fragment-bytes" => {
+                fragment_bytes = parse_value(&mut arguments, &argument)?;
+            }
+            "--delay-ms" => delay_ms = parse_value(&mut arguments, &argument)?,
+            "--io-timeout-seconds" => {
+                io_timeout_seconds = parse_value(&mut arguments, &argument)?;
+            }
+            "--lifetime-seconds" => {
+                lifetime = Some(Duration::from_secs(parse_value(&mut arguments, &argument)?));
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    if range_kib == 0 || fragment_bytes == 0 || io_timeout_seconds == 0 {
+        return Err(
+            "--range-kib, --fragment-bytes and --io-timeout-seconds must be greater than zero"
+                .to_owned(),
+        );
+    }
+
+    let size_bytes = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "--size-mib is too large".to_owned())?;
+    let range_bytes = range_kib
+        .checked_mul(1024)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| "--range-kib is too large".to_owned())?;
+    let fragment_bytes =
+        usize::try_from(fragment_bytes).map_err(|_| "--fragment-bytes is too large".to_owned())?;
+    Ok(LoopbackProbeOptions {
+        size_bytes,
+        range_bytes,
+        fragment_bytes,
+        range_delay: Duration::from_millis(delay_ms),
+        connect_timeout: Duration::from_secs(2),
+        io_timeout: Duration::from_secs(io_timeout_seconds),
+        lifetime,
+        async_mode,
+    })
 }
 
 fn parse_pause_probe_options(

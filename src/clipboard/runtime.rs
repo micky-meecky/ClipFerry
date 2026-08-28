@@ -24,6 +24,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error, HRESULT, Interface, Result, w};
 
 use super::data_object::VirtualFileDataObject;
+use super::loopback::{
+    DEFAULT_MAX_WORKERS, LOOPBACK_FILE_ID, LOOPBACK_TEST_FILE_NAME, LoopbackControlClient,
+    LoopbackServer, LoopbackServerConfig, TcpRangeSource,
+};
 use super::probe::ProbeState;
 use super::source::{MemorySource, ReadAtSource};
 use super::transfer::{GeneratedSource, TransferControl};
@@ -39,6 +43,18 @@ pub struct PauseProbeOptions {
     pub size_bytes: u64,
     pub chunk_bytes: usize,
     pub chunk_delay: Duration,
+    pub lifetime: Option<Duration>,
+    pub async_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LoopbackProbeOptions {
+    pub size_bytes: u64,
+    pub range_bytes: usize,
+    pub fragment_bytes: usize,
+    pub range_delay: Duration,
+    pub connect_timeout: Duration,
+    pub io_timeout: Duration,
     pub lifetime: Option<Duration>,
     pub async_mode: bool,
 }
@@ -308,6 +324,96 @@ pub fn run_pause_probe(options: PauseProbeOptions) -> Result<()> {
     Ok(())
 }
 
+/// Registers a virtual file whose bytes are fetched from a bounded `127.0.0.1` range server.
+///
+/// # Errors
+///
+/// Returns a protocol, socket, COM, Win32, or thread-start error if setup or pumping fails.
+pub fn run_loopback_probe(options: LoopbackProbeOptions) -> Result<()> {
+    let control = Arc::new(TransferControl::default());
+    let server = LoopbackServer::start(
+        LoopbackServerConfig {
+            length: options.size_bytes,
+            file_id: LOOPBACK_FILE_ID,
+            max_range_bytes: options.range_bytes,
+            fragment_bytes: options.fragment_bytes,
+            range_delay: options.range_delay,
+            socket_timeout: options.io_timeout,
+            max_workers: DEFAULT_MAX_WORKERS,
+        },
+        Arc::clone(&control),
+    )?;
+    let tcp_source = Arc::new(TcpRangeSource::new(
+        server.address(),
+        LOOPBACK_FILE_ID,
+        options.size_bytes,
+        options.range_bytes,
+        options.connect_timeout,
+        options.io_timeout,
+    )?);
+    let source: Arc<dyn ReadAtSource> = tcp_source.clone();
+    let lease = ClipboardLease::register(
+        Arc::<str>::from(LOOPBACK_TEST_FILE_NAME),
+        source,
+        options.async_mode,
+    )?;
+    if server.metrics().read_requests != 0 {
+        return Err(Error::from_hresult(E_UNEXPECTED));
+    }
+    println!(
+        "READY file={} size={} address={} range={} fragment={} delay_ms={} io_timeout_ms={} async_mode={} deferred_reads={} network_reads=0 lifetime={}",
+        LOOPBACK_TEST_FILE_NAME,
+        options.size_bytes,
+        server.address(),
+        options.range_bytes,
+        options.fragment_bytes,
+        options.range_delay.as_millis(),
+        options.io_timeout.as_millis(),
+        options.async_mode,
+        lease.probe.read_calls(),
+        options.lifetime.map_or_else(
+            || "infinite".to_owned(),
+            |duration| format!("{}s", duration.as_secs())
+        )
+    );
+    println!("CONTROL transport=tcp commands=pause,resume,cancel,status,stop,quit");
+    let _ = std::io::stdout().flush();
+
+    let main_thread_id = unsafe { GetCurrentThreadId() };
+    spawn_loopback_control_input(
+        Arc::new(LoopbackControlClient::new(tcp_source)),
+        main_thread_id,
+    )?;
+    let timer = options.lifetime.map(set_exit_timer).transpose()?;
+    let loop_result = message_loop(timer, &lease);
+    control.cancel()?;
+    loop_result?;
+    if let Some(timer) = timer {
+        let _ = unsafe { KillTimer(None, timer) };
+    }
+
+    let current_status = lease.current_status();
+    let metrics = server.metrics();
+    println!(
+        "STOP current_clipboard={} status={:#010X} control_state={} connections={} network_reads={} served_bytes={} unique_bytes={} ranges={} coverage_saturated={} max_concurrent_reads={} protocol_errors={} read_calls={} events={} dropped_events={}",
+        current_status == S_OK,
+        current_status.0.cast_unsigned(),
+        control.state()?,
+        metrics.connections,
+        metrics.read_requests,
+        metrics.served_bytes,
+        metrics.unique_bytes,
+        metrics.retained_ranges,
+        metrics.coverage_saturated,
+        metrics.max_concurrent_reads,
+        metrics.protocol_errors,
+        lease.probe.read_calls(),
+        lease.probe.event_count(),
+        lease.probe.dropped_events()
+    );
+    Ok(())
+}
+
 fn spawn_control_input(control: Arc<TransferControl>, main_thread_id: u32) -> Result<()> {
     std::thread::Builder::new()
         .name("clipferry-probe-control".to_owned())
@@ -338,6 +444,51 @@ fn spawn_control_input(control: Arc<TransferControl>, main_thread_id: u32) -> Re
                     ),
                     Err(error) => eprintln!(
                         "CONTROL error={:#010X} command={command}",
+                        error.code().0.cast_unsigned()
+                    ),
+                }
+                let _ = std::io::stdout().flush();
+                if command == "quit" || command == "stop" {
+                    let _ = unsafe {
+                        PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                    };
+                    break;
+                }
+            }
+        })
+        .map_err(|_| Error::from_hresult(E_UNEXPECTED))?;
+    Ok(())
+}
+
+fn spawn_loopback_control_input(
+    client: Arc<LoopbackControlClient>,
+    main_thread_id: u32,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("clipferry-loopback-control".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    eprintln!("CONTROL input_error=true");
+                    break;
+                };
+                let command = line.trim().to_ascii_lowercase();
+                let state = match command.as_str() {
+                    "pause" => client.pause(),
+                    "resume" => client.resume(),
+                    "cancel" | "quit" => client.cancel(),
+                    "status" | "stop" => client.state(),
+                    "" => continue,
+                    _ => {
+                        eprintln!("CONTROL unknown={command:?}");
+                        continue;
+                    }
+                };
+                match state {
+                    Ok(state) => println!("CONTROL transport=tcp state={state}"),
+                    Err(error) => eprintln!(
+                        "CONTROL transport=tcp error={:#010X} command={command}",
                         error.code().0.cast_unsigned()
                     ),
                 }
