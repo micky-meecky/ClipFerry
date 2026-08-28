@@ -115,7 +115,7 @@ impl VirtualStream {
 
 impl ISequentialStream_Impl for VirtualStream_Impl {
     fn Read(&self, destination: *mut c_void, requested: u32, read_out: *mut u32) -> HRESULT {
-        catch_com_hresult(|| {
+        let result = catch_com_hresult(|| {
             if !read_out.is_null() {
                 unsafe { read_out.write(0) };
             }
@@ -129,7 +129,14 @@ impl ISequentialStream_Impl for VirtualStream_Impl {
                 }
                 Err(error) => error.code(),
             }
-        })
+        });
+        if result.is_err() {
+            self.probe.record(
+                "IStream::ReadFailed",
+                format_args!("result={:#010X}", result.0.cast_unsigned()),
+            );
+        }
+        result
     }
 
     fn Write(&self, _source: *const c_void, _requested: u32, written_out: *mut u32) -> HRESULT {
@@ -442,17 +449,24 @@ mod tests {
 
     #[test]
     fn source_panics_are_contained_at_the_com_boundary() {
+        let probe = Arc::new(ProbeState::default());
         let stream = VirtualStream::create(
             Arc::new(PanicSource),
             Arc::<str>::from("panic.txt"),
             0,
-            Arc::new(ProbeState::default()),
+            Arc::clone(&probe),
         );
         let mut byte = 0_u8;
 
         assert_eq!(
             unsafe { stream.Read((&raw mut byte).cast(), 1, None) },
             E_UNEXPECTED
+        );
+        assert!(
+            probe
+                .events()
+                .iter()
+                .any(|event| event.contains("IStream::ReadFailed") && event.contains("0x8000FFFF"))
         );
     }
 

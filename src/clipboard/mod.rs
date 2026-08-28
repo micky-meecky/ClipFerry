@@ -4,9 +4,10 @@ mod probe;
 mod runtime;
 mod source;
 mod stream;
+mod transfer;
 
 pub use probe::ProbeState;
-pub use runtime::{ClipboardProbeOptions, run_clipboard_probe};
+pub use runtime::{ClipboardProbeOptions, PauseProbeOptions, run_clipboard_probe, run_pause_probe};
 
 pub const TEST_FILE_NAME: &str = "RemoteClipboard-Test.txt";
 pub const TEST_FILE_CONTENT: &[u8] = b"ClipFerry virtual file stream test.\r\n";
