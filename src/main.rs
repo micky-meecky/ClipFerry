@@ -2,8 +2,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clipferry::clipboard::{
-    ClipboardProbeOptions, LoopbackProbeOptions, PauseProbeOptions, run_clipboard_probe,
-    run_loopback_probe, run_pause_probe,
+    ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
+    run_clipboard_probe, run_file_capture_probe, run_loopback_probe, run_pause_probe,
 };
 
 fn main() -> ExitCode {
@@ -51,6 +51,11 @@ fn run() -> Result<(), String> {
             run_loopback_probe(options)
                 .map_err(|error| format!("{error} ({:#010X})", error.code().0.cast_unsigned()))
         }
+        "file-capture-test" => {
+            let options = parse_file_capture_probe_options(arguments)?;
+            run_file_capture_probe(options)
+                .map_err(|error| format!("{error} ({:#010X})", error.code().0.cast_unsigned()))
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -68,6 +73,37 @@ fn print_usage() {
     println!(
         "  clipferry loopback-clipboard-test [--size-mib <MiB>] [--range-kib <KiB>] [--fragment-bytes <bytes>] [--delay-ms <ms>] [--io-timeout-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
     );
+    println!(
+        "  clipferry file-capture-test [--offer-ttl-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
+    );
+}
+
+fn parse_file_capture_probe_options(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<FileCaptureProbeOptions, String> {
+    let mut offer_ttl_seconds = 300_u64;
+    let mut lifetime = None;
+    let mut async_mode = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--async-mode" => async_mode = true,
+            "--offer-ttl-seconds" => {
+                offer_ttl_seconds = parse_value(&mut arguments, &argument)?;
+            }
+            "--lifetime-seconds" => {
+                lifetime = Some(Duration::from_secs(parse_value(&mut arguments, &argument)?));
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    if offer_ttl_seconds == 0 {
+        return Err("--offer-ttl-seconds must be greater than zero".to_owned());
+    }
+    Ok(FileCaptureProbeOptions {
+        offer_ttl: Duration::from_secs(offer_ttl_seconds),
+        lifetime,
+        async_mode,
+    })
 }
 
 fn parse_loopback_probe_options(

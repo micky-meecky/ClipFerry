@@ -6,24 +6,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::System::Com::{APTTYPE, APTTYPEQUALIFIER, CoGetApartmentType};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProbeState {
     read_calls: AtomicU64,
     event_count: AtomicU64,
     dropped_events: AtomicU64,
     events: Mutex<VecDeque<String>>,
+    verbose: bool,
 }
 
 const MAX_RETAINED_EVENTS: usize = 4_096;
 
 impl ProbeState {
+    /// Creates a probe that retains every event but only writes lifecycle and
+    /// failure events to stderr. This keeps Explorer's speculative format
+    /// probing from flooding long-running capture sessions.
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self {
+            verbose: false,
+            ..Self::default()
+        }
+    }
+
     pub fn record(&self, method: &str, detail: impl std::fmt::Display) {
         let thread_id = unsafe { GetCurrentThreadId() };
         let apartment = apartment_description();
         let event =
             format!("COM method={method} thread={thread_id} apartment={apartment} {detail}");
 
-        let _ = writeln!(std::io::stderr().lock(), "{event}");
+        if self.verbose || is_key_event(method) {
+            let _ = writeln!(std::io::stderr().lock(), "{event}");
+        }
         self.retain(event);
     }
 
@@ -68,6 +82,28 @@ impl ProbeState {
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
     }
+}
+
+impl Default for ProbeState {
+    fn default() -> Self {
+        Self {
+            read_calls: AtomicU64::new(0),
+            event_count: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
+            verbose: true,
+        }
+    }
+}
+
+fn is_key_event(method: &str) -> bool {
+    matches!(
+        method,
+        "OleSetClipboard"
+            | "WM_CLIPBOARDUPDATE"
+            | "IStream::ReadFailed"
+            | "CapturedClipboardLease::drop"
+    )
 }
 
 fn apartment_description() -> String {

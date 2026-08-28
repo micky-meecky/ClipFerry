@@ -16,13 +16,14 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows::Win32::System::Ole::DROPEFFECT_COPY;
+use windows::Win32::System::Ole::{DROPEFFECT_COPY, ReleaseStgMedium};
 use windows::Win32::UI::Shell::{
-    CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT, FD_ATTRIBUTES,
-    FD_FILESIZE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, IDataObjectAsyncCapability,
-    IDataObjectAsyncCapability_Impl,
+    CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_LOGICALPERFORMEDDROPEFFECT,
+    CFSTR_PASTESUCCEEDED, CFSTR_PERFORMEDDROPEFFECT, CFSTR_PREFERREDDROPEFFECT, FD_ACCESSTIME,
+    FD_ATTRIBUTES, FD_CREATETIME, FD_FILESIZE, FD_UNICODE, FD_WRITESTIME, FILEDESCRIPTORW,
+    FILEGROUPDESCRIPTORW, IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl,
 };
 use windows::core::{BOOL, Error, HRESULT, Ref, Result, implement, w};
 
@@ -38,6 +39,9 @@ struct ClipboardFormats {
     contents: u16,
     preferred_effect: u16,
     origin: u16,
+    performed_effect: u16,
+    logical_performed_effect: u16,
+    paste_succeeded: u16,
 }
 
 impl ClipboardFormats {
@@ -47,6 +51,9 @@ impl ClipboardFormats {
             contents: register_format(CFSTR_FILECONTENTS)?,
             preferred_effect: register_format(CFSTR_PREFERREDDROPEFFECT)?,
             origin: register_format(w!("ClipFerry.SourceOffer.v1"))?,
+            performed_effect: register_format(CFSTR_PERFORMEDDROPEFFECT)?,
+            logical_performed_effect: register_format(CFSTR_LOGICALPERFORMEDDROPEFFECT)?,
+            paste_succeeded: register_format(CFSTR_PASTESUCCEEDED)?,
         })
     }
 
@@ -57,6 +64,12 @@ impl ClipboardFormats {
             format_etc(self.preferred_effect, -1, TYMED_HGLOBAL.0.cast_unsigned()),
             format_etc(self.origin, -1, TYMED_HGLOBAL.0.cast_unsigned()),
         ]
+    }
+
+    fn is_feedback(self, format: u16) -> bool {
+        format == self.performed_effect
+            || format == self.logical_performed_effect
+            || format == self.paste_succeeded
     }
 }
 
@@ -81,11 +94,36 @@ fn format_etc(format: u16, index: i32, medium: u32) -> FORMATETC {
 #[implement(IDataObject, IDataObjectAsyncCapability)]
 pub struct VirtualFileDataObject {
     formats: ClipboardFormats,
-    file_name: Arc<str>,
+    descriptor: VirtualFileDescriptor,
+    origin_payload: Arc<[u8]>,
     source: Arc<dyn ReadAtSource>,
     probe: Arc<ProbeState>,
     async_mode: AtomicBool,
     in_operation: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualFileDescriptor {
+    pub file_name: Arc<str>,
+    pub size: u64,
+    pub attributes: u32,
+    pub creation_time: Option<FILETIME>,
+    pub last_access_time: Option<FILETIME>,
+    pub last_write_time: Option<FILETIME>,
+}
+
+impl VirtualFileDescriptor {
+    #[must_use]
+    pub fn basic(file_name: Arc<str>, size: u64) -> Self {
+        Self {
+            file_name,
+            size,
+            attributes: FILE_ATTRIBUTE_NORMAL.0,
+            creation_time: None,
+            last_access_time: None,
+            last_write_time: None,
+        }
+    }
 }
 
 impl VirtualFileDataObject {
@@ -94,10 +132,31 @@ impl VirtualFileDataObject {
         source: Arc<dyn ReadAtSource>,
         probe: Arc<ProbeState>,
     ) -> Result<IDataObject> {
+        let descriptor = VirtualFileDescriptor::basic(file_name, source.len());
+        Self::create_with_descriptor(
+            descriptor,
+            source,
+            probe,
+            Arc::<[u8]>::from(&b"ClipFerry\0"[..]),
+        )
+    }
+
+    pub fn create_with_descriptor(
+        descriptor: VirtualFileDescriptor,
+        source: Arc<dyn ReadAtSource>,
+        probe: Arc<ProbeState>,
+        origin_payload: Arc<[u8]>,
+    ) -> Result<IDataObject> {
+        if descriptor.size != source.len() || origin_payload.is_empty() {
+            return Err(Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
         let formats = ClipboardFormats::register()?;
         let object: IDataObject = Self {
             formats,
-            file_name,
+            descriptor,
+            origin_payload,
             source,
             probe,
             async_mode: AtomicBool::new(false),
@@ -142,7 +201,7 @@ impl VirtualFileDataObject {
         if format.cfFormat == self.formats.contents {
             let stream = VirtualStream::create(
                 Arc::clone(&self.source),
-                Arc::clone(&self.file_name),
+                Arc::clone(&self.descriptor.file_name),
                 0,
                 Arc::clone(&self.probe),
             );
@@ -152,29 +211,39 @@ impl VirtualFileDataObject {
             return hglobal_medium(&DROPEFFECT_COPY.0.to_ne_bytes());
         }
         if format.cfFormat == self.formats.origin {
-            return hglobal_medium(b"ClipFerry\0");
+            return hglobal_medium(&self.origin_payload);
         }
         Err(Error::from_hresult(DV_E_FORMATETC))
     }
 
     fn file_descriptor_medium(&self) -> Result<STGMEDIUM> {
-        let file_size = self.source.len();
+        let file_size = self.descriptor.size;
         let file_size_high =
             u32::try_from(file_size >> 32).expect("the high half of a u64 always fits in a u32");
         let file_size_low = u32::try_from(file_size & u64::from(u32::MAX))
             .expect("the low half of a u64 always fits in a u32");
+        let mut flags = (FD_ATTRIBUTES.0 | FD_FILESIZE.0 | FD_UNICODE.0).cast_unsigned();
+        if self.descriptor.creation_time.is_some() {
+            flags |= FD_CREATETIME.0.cast_unsigned();
+        }
+        if self.descriptor.last_access_time.is_some() {
+            flags |= FD_ACCESSTIME.0.cast_unsigned();
+        }
+        if self.descriptor.last_write_time.is_some() {
+            flags |= FD_WRITESTIME.0.cast_unsigned();
+        }
         let mut descriptor = FILEDESCRIPTORW {
-            dwFlags: (FD_ATTRIBUTES.0 | FD_FILESIZE.0).cast_unsigned(),
-            dwFileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+            dwFlags: flags,
+            dwFileAttributes: self.descriptor.attributes,
             nFileSizeHigh: file_size_high,
             nFileSizeLow: file_size_low,
-            ftCreationTime: FILETIME::default(),
-            ftLastAccessTime: FILETIME::default(),
-            ftLastWriteTime: FILETIME::default(),
+            ftCreationTime: self.descriptor.creation_time.unwrap_or_default(),
+            ftLastAccessTime: self.descriptor.last_access_time.unwrap_or_default(),
+            ftLastWriteTime: self.descriptor.last_write_time.unwrap_or_default(),
             ..Default::default()
         };
         let mut file_name = [0_u16; 260];
-        write_file_name(&mut file_name, &self.file_name)?;
+        write_file_name(&mut file_name, &self.descriptor.file_name)?;
         descriptor.cFileName = file_name;
         let group = FILEGROUPDESCRIPTORW {
             cItems: 1,
@@ -210,8 +279,13 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
         })
     }
 
-    fn GetDataHere(&self, _format: *const FORMATETC, _medium: *mut STGMEDIUM) -> Result<()> {
-        catch_com_result(|| Err(Error::from_hresult(E_NOTIMPL)))
+    fn GetDataHere(&self, format: *const FORMATETC, medium: *mut STGMEDIUM) -> Result<()> {
+        catch_com_result(|| {
+            if format.is_null() || medium.is_null() {
+                return Err(Error::from_hresult(E_POINTER));
+            }
+            Err(Error::from_hresult(E_NOTIMPL))
+        })
     }
 
     fn QueryGetData(&self, format_ptr: *const FORMATETC) -> HRESULT {
@@ -248,11 +322,58 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
 
     fn SetData(
         &self,
-        _format: *const FORMATETC,
-        _medium: *const STGMEDIUM,
-        _release: BOOL,
+        format_ptr: *const FORMATETC,
+        medium_ptr: *const STGMEDIUM,
+        release: BOOL,
     ) -> Result<()> {
-        catch_com_result(|| Err(Error::from_hresult(E_NOTIMPL)))
+        catch_com_result(|| {
+            if format_ptr.is_null() || medium_ptr.is_null() {
+                return Err(Error::from_hresult(E_POINTER));
+            }
+            let format = unsafe { format_ptr.read() };
+            if !format.ptd.is_null() {
+                return Err(Error::from_hresult(DV_E_DVTARGETDEVICE));
+            }
+            if !self.formats.is_feedback(format.cfFormat) {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            }
+            if format.dwAspect != DVASPECT_CONTENT.0 {
+                return Err(Error::from_hresult(DV_E_DVASPECT));
+            }
+            if format.lindex != -1 {
+                return Err(Error::from_hresult(DV_E_LINDEX));
+            }
+            if format.tymed & TYMED_HGLOBAL.0.cast_unsigned() == 0 {
+                return Err(Error::from_hresult(DV_E_TYMED));
+            }
+            let mut medium = unsafe { medium_ptr.read() };
+            if medium.tymed != TYMED_HGLOBAL.0.cast_unsigned() {
+                return Err(Error::from_hresult(DV_E_TYMED));
+            }
+            let global = unsafe { medium.u.hGlobal };
+            if global.0.is_null() || unsafe { GlobalSize(global) } < size_of::<u32>() {
+                return Err(Error::from_hresult(DV_E_TYMED));
+            }
+            let locked = unsafe { GlobalLock(global) };
+            if locked.is_null() {
+                return Err(Error::from_thread());
+            }
+            let effect = unsafe { locked.cast::<u32>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            self.probe.record(
+                "IDataObject::SetData",
+                format_args!(
+                    "format={} effect={} release={}",
+                    format.cfFormat,
+                    effect,
+                    release.as_bool()
+                ),
+            );
+            if release.as_bool() {
+                unsafe { ReleaseStgMedium(&raw mut medium) };
+            }
+            Ok(())
+        })
     }
 
     fn EnumFormatEtc(&self, direction: u32) -> Result<IEnumFORMATETC> {
@@ -349,20 +470,60 @@ impl IDataObjectAsyncCapability_Impl for VirtualFileDataObject_Impl {
 }
 
 fn write_file_name(destination: &mut [u16; 260], name: &str) -> Result<()> {
+    validate_virtual_file_name(name)?;
+    let encoded: Vec<u16> = name.encode_utf16().collect();
+    destination[..encoded.len()].copy_from_slice(&encoded);
+    destination[encoded.len()] = 0;
+    Ok(())
+}
+
+pub(crate) fn validate_virtual_file_name(name: &str) -> Result<()> {
     if name.is_empty()
-        || name.contains(['\\', '/'])
+        || name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
         || name.ends_with([' ', '.'])
         || name.chars().any(char::is_control)
+        || is_reserved_dos_name(name)
     {
         return Err(Error::from_hresult(DV_E_FORMATETC));
     }
     let encoded: Vec<u16> = name.encode_utf16().collect();
-    if encoded.len() >= destination.len() {
+    if encoded.len() >= 260 {
         return Err(Error::from_hresult(DV_E_FORMATETC));
     }
-    destination[..encoded.len()].copy_from_slice(&encoded);
-    destination[encoded.len()] = 0;
     Ok(())
+}
+
+fn is_reserved_dos_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+        || stem.eq_ignore_ascii_case("CLOCK$")
+    {
+        return true;
+    }
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn hglobal_medium(bytes: &[u8]) -> Result<STGMEDIUM> {
@@ -405,20 +566,23 @@ mod tests {
 
     use windows::Win32::Foundation::{
         DV_E_DVASPECT, DV_E_DVTARGETDEVICE, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_POINTER,
-        S_FALSE, S_OK,
+        FILETIME, S_FALSE, S_OK,
     };
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
     use windows::Win32::System::Com::{
         DATADIR_GET, FORMATETC, IBindCtx, IStream, TYMED_HGLOBAL, TYMED_ISTREAM,
     };
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::ReleaseStgMedium;
     use windows::Win32::UI::Shell::{
-        FD_ATTRIBUTES, FD_FILESIZE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
-        IDataObjectAsyncCapability,
+        FD_ACCESSTIME, FD_ATTRIBUTES, FD_CREATETIME, FD_FILESIZE, FD_UNICODE, FD_WRITESTIME,
+        FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, IDataObjectAsyncCapability,
     };
     use windows::core::Interface;
 
-    use super::{ClipboardFormats, VirtualFileDataObject, format_etc, write_file_name};
+    use super::{
+        ClipboardFormats, VirtualFileDataObject, VirtualFileDescriptor, format_etc, write_file_name,
+    };
     use crate::clipboard::probe::ProbeState;
     use crate::clipboard::source::{MemorySource, ReadAtSource};
 
@@ -561,6 +725,7 @@ mod tests {
         let file_name = unsafe { std::ptr::addr_of!(descriptor.cFileName).read_unaligned() };
         assert_ne!(flags & FD_ATTRIBUTES.0.cast_unsigned(), 0);
         assert_ne!(flags & FD_FILESIZE.0.cast_unsigned(), 0);
+        assert_ne!(flags & FD_UNICODE.0.cast_unsigned(), 0);
         assert_eq!(size_high, 0);
         assert_eq!(size_low, 5);
         let name_length = file_name
@@ -574,6 +739,72 @@ mod tests {
 
         let _ = unsafe { GlobalUnlock(global) };
         unsafe { ReleaseStgMedium(&mut medium) };
+    }
+
+    #[test]
+    fn captured_descriptor_preserves_times_and_private_offer_identity() {
+        let probe = Arc::new(ProbeState::default());
+        let source: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"captured"[..]));
+        let creation = FILETIME {
+            dwLowDateTime: 11,
+            dwHighDateTime: 12,
+        };
+        let access = FILETIME {
+            dwLowDateTime: 21,
+            dwHighDateTime: 22,
+        };
+        let write = FILETIME {
+            dwLowDateTime: 31,
+            dwHighDateTime: 32,
+        };
+        let object = VirtualFileDataObject::create_with_descriptor(
+            VirtualFileDescriptor {
+                file_name: Arc::<str>::from("captured.bin"),
+                size: 8,
+                attributes: FILE_ATTRIBUTE_NORMAL.0,
+                creation_time: Some(creation),
+                last_access_time: Some(access),
+                last_write_time: Some(write),
+            },
+            source,
+            probe,
+            Arc::<[u8]>::from(&b"private-offer-123"[..]),
+        )
+        .unwrap();
+        let formats = ClipboardFormats::register().unwrap();
+        let descriptor_format = format_etc(formats.descriptor, -1, TYMED_HGLOBAL.0.cast_unsigned());
+        let mut descriptor_medium = unsafe { object.GetData(&descriptor_format) }.unwrap();
+        let descriptor_global = unsafe { descriptor_medium.u.hGlobal };
+        let locked = unsafe { GlobalLock(descriptor_global) };
+        let descriptor = unsafe {
+            std::ptr::addr_of!((*locked.cast::<FILEGROUPDESCRIPTORW>()).fgd)
+                .cast::<FILEDESCRIPTORW>()
+                .read_unaligned()
+        };
+        let flags = descriptor.dwFlags;
+        assert_ne!(flags & FD_CREATETIME.0.cast_unsigned(), 0);
+        assert_ne!(flags & FD_ACCESSTIME.0.cast_unsigned(), 0);
+        assert_ne!(flags & FD_WRITESTIME.0.cast_unsigned(), 0);
+        let actual_creation =
+            unsafe { std::ptr::addr_of!(descriptor.ftCreationTime).read_unaligned() };
+        let actual_access =
+            unsafe { std::ptr::addr_of!(descriptor.ftLastAccessTime).read_unaligned() };
+        let actual_write =
+            unsafe { std::ptr::addr_of!(descriptor.ftLastWriteTime).read_unaligned() };
+        assert_eq!(actual_creation, creation);
+        assert_eq!(actual_access, access);
+        assert_eq!(actual_write, write);
+        let _ = unsafe { GlobalUnlock(descriptor_global) };
+        unsafe { ReleaseStgMedium(&mut descriptor_medium) };
+
+        let origin_format = format_etc(formats.origin, -1, TYMED_HGLOBAL.0.cast_unsigned());
+        let mut origin_medium = unsafe { object.GetData(&origin_format) }.unwrap();
+        let origin_global = unsafe { origin_medium.u.hGlobal };
+        let locked = unsafe { GlobalLock(origin_global) };
+        let payload = unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), 17) };
+        assert_eq!(payload, b"private-offer-123");
+        let _ = unsafe { GlobalUnlock(origin_global) };
+        unsafe { ReleaseStgMedium(&mut origin_medium) };
     }
 
     #[test]
@@ -591,6 +822,44 @@ mod tests {
         assert_eq!(unsafe { locked.cast::<u32>().read_unaligned() }, 1);
 
         let _ = unsafe { GlobalUnlock(global) };
+        unsafe { ReleaseStgMedium(&mut medium) };
+    }
+
+    #[test]
+    fn shell_feedback_set_data_accepts_hglobal_without_taking_unrequested_ownership() {
+        let (object, probe, formats) = object();
+        let format = format_etc(
+            formats.performed_effect,
+            -1,
+            TYMED_HGLOBAL.0.cast_unsigned(),
+        );
+        let mut medium = super::hglobal_medium(&1_u32.to_ne_bytes()).unwrap();
+
+        unsafe { object.SetData(&raw const format, &raw const medium, false) }.unwrap();
+        let global = unsafe { medium.u.hGlobal };
+        assert!(unsafe { windows::Win32::System::Memory::GlobalSize(global) } >= 4);
+        assert!(
+            probe
+                .events()
+                .iter()
+                .any(|event| event.contains("IDataObject::SetData") && event.contains("effect=1"))
+        );
+
+        unsafe { ReleaseStgMedium(&mut medium) };
+    }
+
+    #[test]
+    fn rejected_set_data_leaves_release_true_medium_owned_by_the_caller() {
+        let (object, _, _) = object();
+        let format = format_etc(1, -1, TYMED_HGLOBAL.0.cast_unsigned());
+        let mut medium = super::hglobal_medium(&1_u32.to_ne_bytes()).unwrap();
+
+        let error =
+            unsafe { object.SetData(&raw const format, &raw const medium, true) }.unwrap_err();
+        assert_eq!(error.code(), DV_E_FORMATETC);
+        let global = unsafe { medium.u.hGlobal };
+        assert!(unsafe { windows::Win32::System::Memory::GlobalSize(global) } >= 4);
+
         unsafe { ReleaseStgMedium(&mut medium) };
     }
 
@@ -674,6 +943,13 @@ mod tests {
             "bad.",
             "bad ",
             "bad\n",
+            "name:stream.bin",
+            "wild*.bin",
+            "question?.bin",
+            "CON",
+            "nul.txt",
+            "Com1.log",
+            "LPT9",
         ] {
             assert!(
                 write_file_name(&mut destination, invalid).is_err(),

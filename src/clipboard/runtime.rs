@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::io::{BufRead as _, Write as _};
 
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, S_OK, WPARAM,
+    CLIPBRD_E_CANT_OPEN, E_INVALIDARG, E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, S_OK, WPARAM,
 };
 use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::DataExchange::{
@@ -24,6 +24,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error, HRESULT, Interface, Result, w};
 
 use super::data_object::VirtualFileDataObject;
+use super::local_file::{
+    CaptureFormats, ClipboardCapture, FileSnapshot, LocalFileOffer, LocalOfferRegistry,
+    capture_single_file_from_clipboard,
+};
 use super::loopback::{
     DEFAULT_MAX_WORKERS, LOOPBACK_FILE_ID, LOOPBACK_TEST_FILE_NAME, LoopbackControlClient,
     LoopbackServer, LoopbackServerConfig, TcpRangeSource,
@@ -55,6 +59,13 @@ pub struct LoopbackProbeOptions {
     pub range_delay: Duration,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
+    pub lifetime: Option<Duration>,
+    pub async_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FileCaptureProbeOptions {
+    pub offer_ttl: Duration,
     pub lifetime: Option<Duration>,
     pub async_mode: bool,
 }
@@ -169,7 +180,7 @@ impl ClipboardLease {
             let capability: IDataObjectAsyncCapability = object.cast()?;
             unsafe { capability.SetAsyncMode(true) }?;
         }
-        unsafe { OleSetClipboard(&object) }?;
+        ole_set_clipboard_with_retry(&object)?;
 
         if probe.read_calls() != 0 {
             return Err(Error::from_hresult(E_UNEXPECTED));
@@ -222,6 +233,239 @@ impl Drop for ClipboardLease {
     }
 }
 
+struct CapturedClipboardLease {
+    object: IDataObject,
+    probe: Arc<ProbeState>,
+    offer: Arc<LocalFileOffer>,
+}
+
+impl CapturedClipboardLease {
+    fn register(offer: Arc<LocalFileOffer>, async_mode: bool) -> Result<Self> {
+        let probe = Arc::new(ProbeState::quiet());
+        let concrete_source = offer.source();
+        let source: Arc<dyn ReadAtSource> = concrete_source.clone();
+        let object = VirtualFileDataObject::create_with_descriptor(
+            offer.descriptor(),
+            source,
+            Arc::clone(&probe),
+            offer.origin_payload(),
+        )?;
+        if async_mode {
+            let capability: IDataObjectAsyncCapability = object.cast()?;
+            unsafe { capability.SetAsyncMode(true) }?;
+        }
+        ole_set_clipboard_with_retry(&object)?;
+        if concrete_source.read_calls() != 0 || concrete_source.bytes_read() != 0 {
+            return Err(Error::from_hresult(E_UNEXPECTED));
+        }
+        probe.record(
+            "OleSetClipboard",
+            format_args!("captured_offer=true deferred_reads=0 async_mode={async_mode}"),
+        );
+        Ok(Self {
+            object,
+            probe,
+            offer,
+        })
+    }
+
+    fn current_status(&self) -> HRESULT {
+        unsafe { ole_is_current_clipboard_raw(Interface::as_raw(&self.object)) }
+    }
+
+    fn is_current(&self) -> bool {
+        self.current_status() == S_OK
+    }
+}
+
+impl Drop for CapturedClipboardLease {
+    fn drop(&mut self) {
+        let status = self.current_status();
+        let source = self.offer.source();
+        self.probe.record(
+            "CapturedClipboardLease::drop",
+            format_args!(
+                "was_current={} status={:#010X} read_calls={} bytes_read={}",
+                status == S_OK,
+                status.0.cast_unsigned(),
+                source.read_calls(),
+                source.bytes_read()
+            ),
+        );
+        if status == S_OK {
+            let _ = unsafe { OleSetClipboard(None::<&IDataObject>) };
+        }
+    }
+}
+
+fn ole_set_clipboard_with_retry(object: &IDataObject) -> Result<()> {
+    const BACKOFF: [Duration; 8] = [
+        Duration::from_millis(5),
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+        Duration::from_millis(40),
+        Duration::from_millis(80),
+        Duration::from_millis(120),
+        Duration::from_millis(160),
+        Duration::from_millis(200),
+    ];
+    let mut last_error = Error::from_hresult(E_UNEXPECTED);
+    for (index, delay) in BACKOFF.into_iter().enumerate() {
+        match unsafe { OleSetClipboard(object) } {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code() == CLIPBRD_E_CANT_OPEN => last_error = error,
+            Err(error) => return Err(error),
+        }
+        if index + 1 != BACKOFF.len() {
+            std::thread::sleep(delay);
+        }
+    }
+    Err(last_error)
+}
+
+struct FileCaptureSession {
+    offer_ttl: Duration,
+    async_mode: bool,
+    registry: LocalOfferRegistry,
+    lease: Option<CapturedClipboardLease>,
+    accepted: u64,
+    rejected: u64,
+    ignored: u64,
+}
+
+impl FileCaptureSession {
+    fn new(options: FileCaptureProbeOptions) -> Self {
+        Self {
+            offer_ttl: options.offer_ttl,
+            async_mode: options.async_mode,
+            registry: LocalOfferRegistry::default(),
+            lease: None,
+            accepted: 0,
+            rejected: 0,
+            ignored: 0,
+        }
+    }
+
+    fn handle_clipboard_update(&mut self, window: HWND, formats: CaptureFormats) {
+        if let Some(current) = self.lease.as_ref()
+            && current.is_current()
+        {
+            current.probe.record(
+                "WM_CLIPBOARDUPDATE",
+                format_args!("current=true loop_suppressed=true"),
+            );
+            return;
+        }
+
+        self.registry.revoke_current();
+        self.lease.take();
+        match capture_single_file_from_clipboard(window, formats) {
+            Ok(ClipboardCapture::Candidate { path, sequence }) => {
+                self.accept_candidate(&path, sequence);
+            }
+            Ok(ClipboardCapture::Rejected(reason)) => {
+                self.rejected = self.rejected.saturating_add(1);
+                println!("CAPTURE accepted=false reason={reason}");
+            }
+            Ok(ClipboardCapture::PrivateOffer) => {
+                self.ignored = self.ignored.saturating_add(1);
+                println!("CAPTURE ignored=true reason=private-origin");
+            }
+            Ok(ClipboardCapture::NotFileClipboard) => {
+                self.ignored = self.ignored.saturating_add(1);
+                println!("CAPTURE ignored=true reason=not-file-clipboard");
+            }
+            Err(error) => {
+                self.rejected = self.rejected.saturating_add(1);
+                eprintln!("CAPTURE accepted=false reason=clipboard-read {error}");
+            }
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    fn accept_candidate(&mut self, path: &std::path::Path, sequence: u32) {
+        let snapshot = match FileSnapshot::capture(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.rejected = self.rejected.saturating_add(1);
+                eprintln!("CAPTURE accepted=false {error}");
+                return;
+            }
+        };
+        let offer = match self.registry.publish(snapshot, self.offer_ttl) {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.rejected = self.rejected.saturating_add(1);
+                eprintln!(
+                    "CAPTURE accepted=false reason=offer-create error={:#010X}",
+                    error.code().0.cast_unsigned()
+                );
+                return;
+            }
+        };
+        match CapturedClipboardLease::register(Arc::clone(&offer), self.async_mode) {
+            Ok(next_lease) => {
+                self.accepted = self.accepted.saturating_add(1);
+                println!(
+                    "CAPTURE accepted=true sequence={} offer={:?} file_id={:?} file={} size={} content_reads=0 ttl_ms={}",
+                    sequence,
+                    offer.offer_id(),
+                    offer.file_id(),
+                    offer.file_name(),
+                    offer.size(),
+                    offer.remaining_ttl().as_millis()
+                );
+                self.lease = Some(next_lease);
+            }
+            Err(error) => {
+                self.rejected = self.rejected.saturating_add(1);
+                self.registry.revoke_current();
+                eprintln!(
+                    "CAPTURE accepted=false reason=clipboard-register error={:#010X}",
+                    error.code().0.cast_unsigned()
+                );
+            }
+        }
+    }
+
+    fn summary(&self) -> CaptureSummary {
+        let Some(current) = self.lease.as_ref() else {
+            return CaptureSummary {
+                current: false,
+                accepted: self.accepted,
+                rejected: self.rejected,
+                ignored: self.ignored,
+                ..CaptureSummary::default()
+            };
+        };
+        let source = current.offer.source();
+        CaptureSummary {
+            current: current.is_current(),
+            accepted: self.accepted,
+            rejected: self.rejected,
+            ignored: self.ignored,
+            offer_age_ms: current.offer.age().as_millis(),
+            read_calls: source.read_calls(),
+            bytes_read: source.bytes_read(),
+            events: current.probe.event_count(),
+            dropped_events: current.probe.dropped_events(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CaptureSummary {
+    current: bool,
+    accepted: u64,
+    rejected: u64,
+    ignored: u64,
+    offer_age_ms: u128,
+    read_calls: u64,
+    bytes_read: u64,
+    events: u64,
+    dropped_events: u64,
+}
+
 /// Registers the fixed virtual-file probe and pumps its clipboard apartment.
 ///
 /// # Errors
@@ -259,6 +503,75 @@ pub fn run_clipboard_probe(options: ClipboardProbeOptions) -> Result<()> {
         lease.probe.read_calls(),
         lease.probe.event_count(),
         lease.probe.dropped_events()
+    );
+    Ok(())
+}
+
+/// Captures a real single-file `CF_HDROP` clipboard, validates it, and republishes it as a
+/// local virtual-file offer without reading file content before Explorer requests a stream.
+///
+/// # Errors
+///
+/// Returns a COM, Win32, clipboard, timer, or thread-start error if the probe cannot run.
+pub fn run_file_capture_probe(options: FileCaptureProbeOptions) -> Result<()> {
+    if options.offer_ttl.is_zero() {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let _apartment = OleApartment::initialize()?;
+    let window = ClipboardWindow::create()?;
+    let formats = CaptureFormats::register()?;
+    let mut session = FileCaptureSession::new(options);
+
+    println!(
+        "READY mode=file-capture waiting_for=CF_HDROP offer_ttl={}s async_mode={} lifetime={}",
+        options.offer_ttl.as_secs(),
+        options.async_mode,
+        options.lifetime.map_or_else(
+            || "infinite".to_owned(),
+            |duration| format!("{}s", duration.as_secs())
+        )
+    );
+    println!("CONTROL commands=status,quit");
+    let _ = std::io::stdout().flush();
+    spawn_capture_control_input(unsafe { GetCurrentThreadId() })?;
+    let timer = options.lifetime.map(set_exit_timer).transpose()?;
+
+    loop {
+        let mut message = MSG::default();
+        let status = unsafe { GetMessageW(&raw mut message, None, 0, 0) }.0;
+        if status == -1 {
+            return Err(Error::from_thread());
+        }
+        if status == 0 || message.message == WM_QUIT {
+            break;
+        }
+        if message.message == WM_TIMER && timer == Some(message.wParam.0) {
+            break;
+        }
+        if message.hwnd == window.handle && message.message == WM_CLIPBOARDUPDATE {
+            session.handle_clipboard_update(window.handle, formats);
+        }
+        unsafe {
+            let _ = TranslateMessage(&raw const message);
+            DispatchMessageW(&raw const message);
+        }
+    }
+
+    if let Some(timer) = timer {
+        let _ = unsafe { KillTimer(None, timer) };
+    }
+    let summary = session.summary();
+    println!(
+        "STOP current_clipboard={current} accepted={accepted} rejected={rejected} ignored={ignored} offer_age_ms={offer_age_ms} read_calls={read_calls} bytes_read={bytes_read} events={events} dropped_events={dropped_events}",
+        current = summary.current,
+        accepted = summary.accepted,
+        rejected = summary.rejected,
+        ignored = summary.ignored,
+        offer_age_ms = summary.offer_age_ms,
+        read_calls = summary.read_calls,
+        bytes_read = summary.bytes_read,
+        events = summary.events,
+        dropped_events = summary.dropped_events
     );
     Ok(())
 }
@@ -454,6 +767,34 @@ fn spawn_control_input(control: Arc<TransferControl>, main_thread_id: u32) -> Re
                     };
                     break;
                 }
+            }
+        })
+        .map_err(|_| Error::from_hresult(E_UNEXPECTED))?;
+    Ok(())
+}
+
+fn spawn_capture_control_input(main_thread_id: u32) -> Result<()> {
+    std::thread::Builder::new()
+        .name("clipferry-capture-control".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    eprintln!("CONTROL input_error=true");
+                    break;
+                };
+                match line.trim().to_ascii_lowercase().as_str() {
+                    "status" => println!("CONTROL state=running"),
+                    "quit" => {
+                        let _ = unsafe {
+                            PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                        };
+                        break;
+                    }
+                    "" => continue,
+                    command => eprintln!("CONTROL unknown={command:?}"),
+                }
+                let _ = std::io::stdout().flush();
             }
         })
         .map_err(|_| Error::from_hresult(E_UNEXPECTED))?;

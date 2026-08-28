@@ -1,5 +1,6 @@
 mod data_object;
 mod format_enum;
+mod local_file;
 mod loopback;
 mod probe;
 mod runtime;
@@ -9,8 +10,8 @@ mod transfer;
 
 pub use probe::ProbeState;
 pub use runtime::{
-    ClipboardProbeOptions, LoopbackProbeOptions, PauseProbeOptions, run_clipboard_probe,
-    run_loopback_probe, run_pause_probe,
+    ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
+    run_clipboard_probe, run_file_capture_probe, run_loopback_probe, run_pause_probe,
 };
 
 pub const TEST_FILE_NAME: &str = "RemoteClipboard-Test.txt";
