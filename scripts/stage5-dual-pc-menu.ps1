@@ -24,7 +24,7 @@ if ([string]::IsNullOrWhiteSpace($DataRoot)) {
 }
 
 $script:IsTreeStage = $Stage6 -or $Stage7
-$script:ExpectedExecutableSha256 = 'D6E40676A0D7404B9AC4F3F8B70C1DD4CDE3F4BA972386FF3FE41E56624F3030'
+$script:ExpectedExecutableSha256 = '7F7B9B3321D89D088F12E145F3D4BCB30EFA167E3C8003DEA3D31E5CBF2FAA31'
 $configName = if ($Stage7) { 'stage7-menu.json' } elseif ($Stage6) { 'stage6-menu.json' } else { 'stage5-menu.json' }
 $script:ConfigPath = Join-Path $DataRoot $configName
 $script:SourceRoot = Join-Path $DataRoot 'source'

@@ -1653,8 +1653,47 @@ impl SecureOfferClient {
     }
 
     fn status(&self, credentials: TransferCredentials) -> io::Result<TransferStatus> {
-        let response = self.command(Opcode::Status, credentials.encode())?;
+        let response = self.command_status_retry_once(credentials.encode())?;
         decode_transfer_status(&response)
+    }
+
+    /// Status is an interactive diagnostic command, so it must not enter the full recovery
+    /// window. When a previously-open control socket became stale while the data connection
+    /// recovered, discard it and make one bounded reconnect attempt instead of exposing the
+    /// stale socket error and requiring the operator to type `status` twice.
+    fn command_status_retry_once(&self, payload: Vec<u8>) -> io::Result<Vec<u8>> {
+        match self.command(Opcode::Status, payload.clone()) {
+            Ok(response) => Ok(response),
+            Err(error)
+                if !self.recovery_policy.max_elapsed.is_zero()
+                    && is_recoverable_network_error(&error) =>
+            {
+                self.recovery_metrics
+                    .transient_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.recovery_metrics
+                    .reconnect_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let _active_recovery = self.recovery_metrics.begin_recovery();
+                match self.command(Opcode::Status, payload) {
+                    Ok(response) => {
+                        self.recovery_metrics
+                            .recovered_commands
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(response)
+                    }
+                    Err(retry_error) => {
+                        if is_recoverable_network_error(&retry_error) {
+                            self.recovery_metrics
+                                .transient_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(retry_error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn command_recovering(
@@ -3229,6 +3268,28 @@ mod tests {
 
         assert_eq!(server.metrics().replayed_requests, 0);
         assert_eq!(client.recovery_snapshot().recovered_commands, 3);
+    }
+
+    #[test]
+    fn status_discards_a_stale_control_connection_and_retries_once() {
+        let (server, base_client, _) = start_generated(4096);
+        let client = recovering_client(&base_client, Duration::from_secs(1));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client.clone(), manifest);
+        let mut byte = [0_u8; 1];
+        source.read_at(0, &mut byte).unwrap();
+
+        server.inject_response_drops(1);
+        let status = source.status().unwrap();
+        assert_eq!(status.state, RemoteTransferState::Running);
+        assert_eq!(status.unique_bytes, 1);
+
+        let recovery = client.recovery_snapshot();
+        assert_eq!(recovery.transient_failures, 1);
+        assert_eq!(recovery.reconnect_attempts, 1);
+        assert_eq!(recovery.recovered_commands, 1);
+        assert_eq!(recovery.exhausted_commands, 0);
+        assert_eq!(recovery.active_recoveries, 0);
     }
 
     #[test]
