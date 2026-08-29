@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod device_store;
 pub mod pairing;
 pub mod security;
+pub mod tray;
 
 pub const APP_NAME: &str = "ClipFerry";
 

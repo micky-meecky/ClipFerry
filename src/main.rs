@@ -18,6 +18,9 @@ use clipferry::security::{
 };
 
 fn main() -> ExitCode {
+    if std::env::args_os().len() == 1 {
+        return run_tray(true);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -37,6 +40,33 @@ fn run() -> Result<(), String> {
     };
 
     match command.as_str() {
+        "tray" => {
+            let detach_console = match arguments.next().as_deref() {
+                None => true,
+                Some("--console") if arguments.next().is_none() => false,
+                Some(argument) => return Err(format!("unknown tray argument: {argument}")),
+            };
+            clipferry::tray::run(detach_console)
+        }
+        "tray-self-test" => clipferry::tray::self_test(),
+        "tray-show" => clipferry::tray::show_existing_status(),
+        "tray-exit" => clipferry::tray::exit_existing(),
+        "autostart-status" => {
+            println!("AUTOSTART state={}", clipferry::tray::autostart_status()?);
+            Ok(())
+        }
+        "autostart-enable" => {
+            clipferry::tray::set_autostart(true)?;
+            println!("AUTOSTART state=enabled");
+            Ok(())
+        }
+        "autostart-disable" => {
+            clipferry::tray::set_autostart(false)?;
+            println!("AUTOSTART state=disabled");
+            Ok(())
+        }
+        "pair-wizard" => run_pair_wizard(),
+        "trust-wizard" => run_trust_wizard(),
         "clipboard-test" => {
             let mut lifetime = None;
             while let Some(argument) = arguments.next() {
@@ -217,6 +247,10 @@ fn run() -> Result<(), String> {
 
 fn print_usage() {
     println!("Usage:");
+    println!("  clipferry tray [--console]");
+    println!("  clipferry tray-self-test|tray-show|tray-exit");
+    println!("  clipferry autostart-status|autostart-enable|autostart-disable");
+    println!("  clipferry pair-wizard|trust-wizard");
     println!("  clipferry clipboard-test [--lifetime-seconds <seconds>]");
     println!(
         "  clipferry clipboard-pause-test [--size-mib <MiB>] [--chunk-kib <KiB>] [--delay-ms <ms>] [--async-mode] [--lifetime-seconds <seconds>]"
@@ -256,6 +290,130 @@ fn print_usage() {
     println!(
         "  For secure-*-test, --store <directory> --peer-fingerprint <SHA-256> replaces the three DER path options"
     );
+}
+
+fn run_tray(detach_console: bool) -> ExitCode {
+    match clipferry::tray::run(detach_console) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("ClipFerry error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_pair_wizard() -> Result<(), String> {
+    let result = run_pair_wizard_inner();
+    if let Err(error) = &result {
+        eprintln!("\n配对失败：{error}");
+    }
+    wait_for_enter("\n按 Enter 关闭此窗口...")?;
+    result
+}
+
+fn run_pair_wizard_inner() -> Result<(), String> {
+    let store = DeviceStore::current_user()
+        .map_err(|error| format!("device store unavailable: {error}"))?;
+    let stored = store
+        .load_or_create_identity()
+        .map_err(|error| format!("device identity initialization failed: {error}"))?;
+    println!("ClipFerry 设备配对");
+    println!("本机指纹：{}", stored.identity.fingerprint());
+    println!("\n两台电脑分别打开此向导：一端选择 1，另一端选择 2。");
+    println!("核对两端出现的 verify_code 完全一致后，必须输入大写 YES。\n");
+    println!("[1] 监听配对");
+    println!("[2] 连接配对");
+    let role = prompt("请选择 1 或 2: ")?;
+    let address_text = match role.as_str() {
+        "1" => prompt("本机监听地址（例如 192.168.1.29:45232）: ")?,
+        "2" => prompt("对端地址（例如 192.168.1.29:45232）: ")?,
+        _ => return Err("只能选择 1 或 2".to_owned()),
+    };
+    let mut address_argument = std::iter::once(address_text);
+    let address = parse_private_socket(&mut address_argument, "address")?;
+    let default_label = if role == "1" {
+        "另一台电脑"
+    } else {
+        "主机"
+    };
+    let label = prompt(&format!("给对端起一个名称 [{default_label}]: "))?;
+    let label = if label.is_empty() {
+        default_label.to_owned()
+    } else {
+        label
+    };
+    if label.len() > 128 || label.chars().any(char::is_control) {
+        return Err("设备名称必须为 1 到 128 个 UTF-8 字节且不能包含控制字符".to_owned());
+    }
+    println!("\n正在建立配对，请保持两端窗口打开...");
+    let pending = if role == "1" {
+        listen_for_pairing(store, address, Duration::from_mins(2))
+            .map_err(|error| format!("pairing listener failed: {error}"))?
+    } else {
+        connect_for_pairing(store, address, Duration::from_mins(2))
+            .map_err(|error| format!("pairing connection failed: {error}"))?
+    };
+    confirm_pairing(pending, &label)
+}
+
+fn run_trust_wizard() -> Result<(), String> {
+    let result = run_trust_wizard_inner();
+    if let Err(error) = &result {
+        eprintln!("\n设备管理失败：{error}");
+    }
+    wait_for_enter("\n按 Enter 关闭此窗口...")?;
+    result
+}
+
+fn run_trust_wizard_inner() -> Result<(), String> {
+    let store = DeviceStore::current_user()
+        .map_err(|error| format!("device store unavailable: {error}"))?;
+    let peers = store
+        .list_peers()
+        .map_err(|error| format!("trust list failed: {error}"))?;
+    println!("ClipFerry 已配对设备\n");
+    if peers.is_empty() {
+        println!("当前没有已配对设备。");
+        return Ok(());
+    }
+    for (index, peer) in peers.iter().enumerate() {
+        println!("[{}] {}\n    {}", index + 1, peer.label, peer.fingerprint);
+    }
+    println!("[0] 仅查看，不做修改");
+    let selection = prompt("\n输入要取消配对的编号: ")?
+        .parse::<usize>()
+        .map_err(|_| "请输入列表中的数字".to_owned())?;
+    if selection == 0 {
+        return Ok(());
+    }
+    let peer = peers
+        .get(selection.saturating_sub(1))
+        .ok_or_else(|| "设备编号超出范围".to_owned())?;
+    println!("\n即将取消配对：{} ({})", peer.label, peer.fingerprint);
+    if prompt("输入大写 REVOKE 确认: ")? != "REVOKE" {
+        return Err("未输入大写 REVOKE，没有修改信任列表".to_owned());
+    }
+    store
+        .revoke_peer(peer.fingerprint)
+        .map_err(|error| format!("trust revocation failed: {error}"))?;
+    println!("已取消配对：{}", peer.label);
+    Ok(())
+}
+
+fn prompt(message: &str) -> Result<String, String> {
+    print!("{message}");
+    std::io::Write::flush(&mut std::io::stdout())
+        .map_err(|error| format!("console output failed: {error}"))?;
+    let mut value = String::new();
+    std::io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("console input failed: {error}"))?;
+    Ok(value.trim().to_owned())
+}
+
+fn wait_for_enter(message: &str) -> Result<(), String> {
+    let _ = prompt(message)?;
+    Ok(())
 }
 
 #[derive(Default)]
