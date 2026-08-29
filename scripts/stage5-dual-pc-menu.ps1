@@ -20,7 +20,7 @@ if ([string]::IsNullOrWhiteSpace($DataRoot)) {
     $DataRoot = Join-Path $env:LOCALAPPDATA "ClipFerry\$stageDirectory"
 }
 
-$script:ExpectedExecutableSha256 = 'CF0A9E709917F5B59A966F2E0A0EAD0A4690B3532C0D076909B3D8B3EBDC94B6'
+$script:ExpectedExecutableSha256 = '17C173EED47630C3C2D9D4E18ED9A196268226229902A53EFB1B41980C2440B7'
 $script:ConfigPath = Join-Path $DataRoot $(if ($Stage6) { 'stage6-menu.json' } else { 'stage5-menu.json' })
 $script:SourceRoot = Join-Path $DataRoot 'source'
 $script:ReceiveRoot = Join-Path $DataRoot 'receive'

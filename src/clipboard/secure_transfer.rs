@@ -32,7 +32,7 @@ const MANIFEST_ENTRY_FIXED_LEN: usize = 55;
 pub const MAX_SECURE_RANGE_BYTES: usize = 256 * 1024;
 pub const MAX_SECURE_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_PAYLOAD: usize = MAX_SECURE_MANIFEST_BYTES;
-const MAX_TRANSFERS: usize = 64;
+const MAX_ACTIVE_TRANSFERS: usize = 64;
 const MAX_BEGIN_NONCES: usize = 4_096;
 const MAX_TRACKED_RANGES: usize = 4_096;
 const DEFAULT_MAX_WORKERS: usize = 32;
@@ -428,13 +428,9 @@ impl ServerState {
             return Err(ResponseStatus::Denied);
         }
         let mut inner = self.inner.lock().map_err(|_| ResponseStatus::Internal)?;
-        inner.transfers.retain(|_, transfer| {
-            transfer.expires_at > now
-                && transfer
-                    .inner
-                    .lock()
-                    .is_ok_and(|state| state.state != RemoteTransferState::Completed)
-        });
+        inner
+            .transfers
+            .retain(|_, transfer| transfer.expires_at > now);
         inner.begin_nonces.retain(|_, expires_at| *expires_at > now);
         if inner.begin_nonces.contains_key(&nonce) {
             self.metrics
@@ -442,7 +438,22 @@ impl ServerState {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(ResponseStatus::Replay);
         }
-        if inner.transfers.len() >= MAX_TRANSFERS || inner.begin_nonces.len() >= MAX_BEGIN_NONCES {
+        let active_transfers = inner
+            .transfers
+            .values()
+            .filter(|transfer| {
+                transfer.inner.lock().map_or(true, |state| {
+                    matches!(
+                        state.state,
+                        RemoteTransferState::Running | RemoteTransferState::Paused
+                    )
+                })
+            })
+            .count();
+        if active_transfers >= MAX_ACTIVE_TRANSFERS
+            || inner.transfers.len() >= MAX_BEGIN_NONCES
+            || inner.begin_nonces.len() >= MAX_BEGIN_NONCES
+        {
             return Err(ResponseStatus::Busy);
         }
         let transfer_id = ProtocolId::random().map_err(|_| ResponseStatus::Internal)?;
@@ -611,9 +622,6 @@ impl ServerState {
         if inner.state == RemoteTransferState::Cancelled {
             return Err(ResponseStatus::Cancelled);
         }
-        if inner.state == RemoteTransferState::Completed {
-            return Err(ResponseStatus::Denied);
-        }
         drop(inner);
 
         self.ensure_peer_allowed(peer)?;
@@ -654,9 +662,6 @@ impl ServerState {
         }
         if inner.state == RemoteTransferState::Cancelled {
             return Err(ResponseStatus::Cancelled);
-        }
-        if inner.state == RemoteTransferState::Completed {
-            return Err(ResponseStatus::Denied);
         }
         inner.coverage.note(offset, read as u64);
         let status = TransferStatus {
@@ -1755,8 +1760,8 @@ impl RemoteTransferRegistry {
     fn remember_source(&self, source: Arc<SecureRemoteSource>) -> Arc<SecureRemoteSource> {
         if let Ok(mut sources) = self.sources.lock() {
             sources.push(Arc::clone(&source));
-            if sources.len() > MAX_TRANSFERS {
-                let excess = sources.len() - MAX_TRANSFERS;
+            if sources.len() > MAX_BEGIN_NONCES {
+                let excess = sources.len() - MAX_BEGIN_NONCES;
                 sources.drain(..excess);
             }
         }
@@ -1923,9 +1928,6 @@ impl ReadAtSource for SecureRemoteSource {
             if status.state == RemoteTransferState::Paused && bytes.is_empty() {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
-            }
-            if status.state == RemoteTransferState::Completed {
-                return Err(Error::from_hresult(E_ACCESSDENIED));
             }
             break bytes;
         };
@@ -2475,6 +2477,68 @@ mod tests {
     }
 
     #[test]
+    fn completed_file_sessions_remain_observable_after_later_files_begin() {
+        let peers = peers();
+        let first: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"first"[..]));
+        let second: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"second"[..]));
+        let offered = SecureOfferedFile::new_tree(
+            vec![
+                (
+                    VirtualFileDescriptor::basic(Arc::from("first.txt"), 5),
+                    Some(first),
+                ),
+                (
+                    VirtualFileDescriptor::basic(Arc::from("second.txt"), 6),
+                    Some(second),
+                ),
+            ],
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.client);
+        let manifest = client.fetch_manifest().unwrap();
+        let registry = RemoteTransferRegistry::default();
+        let first = registry.create_source_for_entry(
+            client.clone(),
+            manifest.clone(),
+            manifest.entries[0].clone(),
+        );
+        let second =
+            registry.create_source_for_entry(client, manifest.clone(), manifest.entries[1].clone());
+
+        let mut first_bytes = [0_u8; 5];
+        assert_eq!(first.read_at(0, &mut first_bytes).unwrap(), 5);
+        let mut eof = [0_u8; 1];
+        assert_eq!(first.read_at(5, &mut eof).unwrap(), 0);
+        assert_eq!(
+            first.status().unwrap().state,
+            RemoteTransferState::Completed
+        );
+
+        let mut second_bytes = [0_u8; 6];
+        assert_eq!(second.read_at(0, &mut second_bytes).unwrap(), 6);
+        assert_eq!(second.read_at(6, &mut eof).unwrap(), 0);
+
+        let mut reread = [0_u8; 1];
+        assert_eq!(first.read_at(0, &mut reread).unwrap(), 1);
+        assert_eq!(reread, [b'f']);
+        let status = registry.status_all().unwrap();
+        assert_eq!(status.state, RemoteTransferState::Completed);
+        assert_eq!(status.started_transfers, 2);
+        assert_eq!(status.unique_bytes, 11);
+        assert_eq!(server.metrics().unique_bytes, 11);
+        assert_eq!(server.metrics().denied_requests, 0);
+    }
+
+    #[test]
     fn group_pause_resume_and_cancel_apply_to_every_started_file_stream() {
         let peers = peers();
         let first: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"first"[..]));
@@ -2738,17 +2802,35 @@ mod tests {
     }
 
     #[test]
-    fn eof_completes_the_transfer_and_registry_retains_observable_status() {
-        let (_server, client, _) = start_generated(32);
+    fn completed_transfer_allows_repeated_eof_and_seeked_rereads() {
+        let (server, client, _) = start_generated(32);
         let manifest = client.fetch_manifest().unwrap();
         let registry = RemoteTransferRegistry::default();
         let source = registry.create_source(client, manifest);
+
+        let mut contents = [0_u8; 32];
+        assert_eq!(source.read_at(0, &mut contents).unwrap(), contents.len());
+        assert_eq!(contents[0], generated_byte(0));
+        assert_eq!(contents[31], generated_byte(31));
+
         let mut byte = [0_u8; 1];
+        assert_eq!(source.read_at(32, &mut byte).unwrap(), 0);
         assert_eq!(source.read_at(32, &mut byte).unwrap(), 0);
         assert_eq!(
             source.status().unwrap().state,
             RemoteTransferState::Completed
         );
+
+        let mut reread = [0_u8; 4];
+        assert_eq!(source.read_at(7, &mut reread).unwrap(), reread.len());
+        assert_eq!(
+            reread,
+            std::array::from_fn(|index| generated_byte(7 + index as u64))
+        );
+        assert_eq!(source.status().unwrap().unique_bytes, 32);
+        assert_eq!(server.metrics().begun_transfers, 1);
+        assert_eq!(server.metrics().denied_requests, 0);
+
         drop(source);
         assert_eq!(registry.live_sources(), 1);
         assert_eq!(
