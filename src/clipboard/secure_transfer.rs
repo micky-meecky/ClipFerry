@@ -37,6 +37,7 @@ const MAX_BEGIN_NONCES: usize = 4_096;
 const MAX_TRACKED_RANGES: usize = 4_096;
 const DEFAULT_MAX_WORKERS: usize = 32;
 const MAX_PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
 const HELLO_ROLE_RECEIVER: u8 = 1;
 const RESPONSE_BIT: u16 = 0x8000;
 
@@ -358,6 +359,7 @@ impl RangeCoverage {
 struct TransferInner {
     state: RemoteTransferState,
     last_control_sequence: u64,
+    last_control_opcode: Option<Opcode>,
     coverage: RangeCoverage,
 }
 
@@ -393,7 +395,15 @@ impl TransferSession {
 
 struct ServerInner {
     transfers: HashMap<ProtocolId, Arc<TransferSession>>,
-    begin_nonces: HashMap<[u8; 32], Instant>,
+    begin_nonces: HashMap<[u8; 32], BeginTransferRecord>,
+}
+
+struct BeginTransferRecord {
+    authorized_peer: CertificateFingerprint,
+    offer_id: ProtocolId,
+    file_id: ProtocolId,
+    transfer_id: ProtocolId,
+    expires_at: Instant,
 }
 
 struct ServerState {
@@ -404,11 +414,23 @@ struct ServerState {
     request_timeout: Duration,
     inner: Mutex<ServerInner>,
     metrics: Arc<SecureMetrics>,
+    injected_response_drops: AtomicUsize,
 }
 
 impl ServerState {
     fn connection_idle_timeout(&self) -> Duration {
         self.transfer_ttl.max(self.request_timeout)
+    }
+
+    fn cleanup_expired_sessions(&self, now: Instant) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .transfers
+                .retain(|_, transfer| transfer.expires_at > now);
+            inner
+                .begin_nonces
+                .retain(|_, record| record.expires_at > now);
+        }
     }
 
     fn begin_transfer(
@@ -431,8 +453,17 @@ impl ServerState {
         inner
             .transfers
             .retain(|_, transfer| transfer.expires_at > now);
-        inner.begin_nonces.retain(|_, expires_at| *expires_at > now);
-        if inner.begin_nonces.contains_key(&nonce) {
+        inner
+            .begin_nonces
+            .retain(|_, record| record.expires_at > now);
+        if let Some(record) = inner.begin_nonces.get(&nonce) {
+            if record.authorized_peer == peer
+                && record.offer_id == offer_id
+                && record.file_id == file_id
+                && let Some(session) = inner.transfers.get(&record.transfer_id)
+            {
+                return Ok(session.credentials());
+            }
             self.metrics
                 .replayed_requests
                 .fetch_add(1, Ordering::Relaxed);
@@ -471,11 +502,21 @@ impl ServerState {
             inner: Mutex::new(TransferInner {
                 state: RemoteTransferState::Running,
                 last_control_sequence: 0,
+                last_control_opcode: None,
                 coverage: RangeCoverage::default(),
             }),
             changed: Condvar::new(),
         });
-        inner.begin_nonces.insert(nonce, expires_at);
+        inner.begin_nonces.insert(
+            nonce,
+            BeginTransferRecord {
+                authorized_peer: peer,
+                offer_id,
+                file_id,
+                transfer_id,
+                expires_at,
+            },
+        );
         inner.transfers.insert(transfer_id, Arc::clone(&session));
         self.metrics.begun_transfers.fetch_add(1, Ordering::Relaxed);
         Ok(session.credentials())
@@ -516,6 +557,12 @@ impl ServerState {
     ) -> WireResult<TransferStatus> {
         let session = self.authenticated_session(peer, credentials)?;
         let mut inner = session.inner.lock().map_err(|_| ResponseStatus::Internal)?;
+        if sequence == inner.last_control_sequence && inner.last_control_opcode == Some(opcode) {
+            return Ok(TransferStatus {
+                state: inner.state,
+                unique_bytes: inner.coverage.unique_bytes,
+            });
+        }
         if sequence <= inner.last_control_sequence {
             self.metrics
                 .replayed_requests
@@ -523,6 +570,7 @@ impl ServerState {
             return Err(ResponseStatus::Replay);
         }
         inner.last_control_sequence = sequence;
+        inner.last_control_opcode = Some(opcode);
         match opcode {
             Opcode::Pause if inner.state == RemoteTransferState::Running => {
                 inner.state = RemoteTransferState::Paused;
@@ -729,6 +777,19 @@ impl ServerState {
             }
         }
     }
+
+    #[cfg(test)]
+    fn inject_response_drops(&self, count: usize) {
+        self.injected_response_drops.store(count, Ordering::Release);
+    }
+
+    fn consume_injected_response_drop(&self) -> bool {
+        self.injected_response_drops
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
 }
 
 pub struct SecureOfferServer {
@@ -822,6 +883,7 @@ impl SecureOfferServer {
                 begin_nonces: HashMap::new(),
             }),
             metrics: Arc::new(SecureMetrics::default()),
+            injected_response_drops: AtomicUsize::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let workers = Arc::new(AtomicUsize::new(0));
@@ -855,6 +917,11 @@ impl SecureOfferServer {
     #[must_use]
     pub fn metrics(&self) -> SecureMetricsSnapshot {
         self.state.metrics.snapshot(self.state.unique_bytes())
+    }
+
+    #[cfg(test)]
+    fn inject_response_drops(&self, count: usize) {
+        self.state.inject_response_drops(count);
     }
 
     pub fn stop(&mut self) {
@@ -898,7 +965,13 @@ fn secure_accept_loop(
     stop: Arc<AtomicBool>,
     workers: Arc<AtomicUsize>,
 ) {
+    let mut next_cleanup = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= next_cleanup {
+            state.cleanup_expired_sessions(now);
+            next_cleanup = now.checked_add(SESSION_CLEANUP_INTERVAL).unwrap_or(now);
+        }
         match listener.accept() {
             Ok((socket, _)) => {
                 state
@@ -936,6 +1009,8 @@ fn secure_accept_loop(
                                 if let Err(error) = result {
                                     if error.kind() == io::ErrorKind::PermissionDenied {
                                         eprintln!("SECURE connection_denied=true");
+                                    } else if is_recoverable_network_error(&error) {
+                                        eprintln!("SECURE connection_lost={error}");
                                     } else {
                                         eprintln!("SECURE connection_error={error}");
                                         worker_state
@@ -1015,6 +1090,12 @@ fn handle_secure_connection(
         })?;
         let opcode = Opcode::try_from(request.opcode)?;
         let response = dispatch_request(state, peer, opcode, &request.payload);
+        if state.consume_injected_response_drop() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "injected response loss after request processing",
+            ));
+        }
         write_frame(
             stream,
             Frame {
@@ -1232,12 +1313,77 @@ pub struct TransferStatus {
     pub unique_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecureRecoveryPolicy {
+    pub max_elapsed: Duration,
+    pub connect_attempt_timeout: Duration,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl SecureRecoveryPolicy {
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            max_elapsed: Duration::ZERO,
+            connect_attempt_timeout: Duration::ZERO,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SecureRecoverySnapshot {
+    pub transient_failures: u64,
+    pub reconnect_attempts: u64,
+    pub recovered_commands: u64,
+    pub exhausted_commands: u64,
+    pub active_recoveries: u64,
+}
+
+#[derive(Default)]
+struct SecureRecoveryMetrics {
+    transient_failures: AtomicU64,
+    reconnect_attempts: AtomicU64,
+    recovered_commands: AtomicU64,
+    exhausted_commands: AtomicU64,
+    active_recoveries: AtomicU64,
+}
+
+impl SecureRecoveryMetrics {
+    fn snapshot(&self) -> SecureRecoverySnapshot {
+        SecureRecoverySnapshot {
+            transient_failures: self.transient_failures.load(Ordering::Relaxed),
+            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
+            recovered_commands: self.recovered_commands.load(Ordering::Relaxed),
+            exhausted_commands: self.exhausted_commands.load(Ordering::Relaxed),
+            active_recoveries: self.active_recoveries.load(Ordering::Relaxed),
+        }
+    }
+
+    fn begin_recovery(self: &Arc<Self>) -> ActiveRecovery {
+        self.active_recoveries.fetch_add(1, Ordering::AcqRel);
+        ActiveRecovery(Arc::clone(self))
+    }
+}
+
+struct ActiveRecovery(Arc<SecureRecoveryMetrics>);
+
+impl Drop for ActiveRecovery {
+    fn drop(&mut self) {
+        self.0.active_recoveries.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone)]
 pub struct SecureOfferClient {
     address: SocketAddr,
     tls: PinnedTlsClient,
     next_request_id: Arc<AtomicU64>,
     connections: Arc<SecureCommandConnections>,
+    recovery_policy: SecureRecoveryPolicy,
+    recovery_metrics: Arc<SecureRecoveryMetrics>,
 }
 
 #[derive(Default)]
@@ -1269,7 +1415,36 @@ impl SecureOfferClient {
             tls,
             next_request_id: Arc::new(AtomicU64::new(1)),
             connections: Arc::new(SecureCommandConnections::default()),
+            recovery_policy: SecureRecoveryPolicy::disabled(),
+            recovery_metrics: Arc::new(SecureRecoveryMetrics::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_recovery_policy(
+        address: SocketAddr,
+        tls: PinnedTlsClient,
+        mut recovery_policy: SecureRecoveryPolicy,
+    ) -> Self {
+        if !recovery_policy.max_elapsed.is_zero() {
+            recovery_policy.connect_attempt_timeout = recovery_policy
+                .connect_attempt_timeout
+                .max(Duration::from_millis(10));
+            recovery_policy.initial_backoff = recovery_policy
+                .initial_backoff
+                .max(Duration::from_millis(10));
+            recovery_policy.max_backoff = recovery_policy
+                .max_backoff
+                .max(recovery_policy.initial_backoff);
+        }
+        let mut client = Self::new(address, tls);
+        client.recovery_policy = recovery_policy;
+        client
+    }
+
+    #[must_use]
+    pub fn recovery_snapshot(&self) -> SecureRecoverySnapshot {
+        self.recovery_metrics.snapshot()
     }
 
     /// Fetches and validates the metadata-only offer over the pinned TLS connection.
@@ -1372,16 +1547,27 @@ impl SecureOfferClient {
         })
     }
 
+    #[cfg(test)]
     fn begin_transfer(
         &self,
         manifest: &OfferManifest,
         entry: &OfferManifestEntry,
     ) -> io::Result<TransferCredentials> {
+        self.begin_transfer_interruptible(manifest, entry, None)
+    }
+
+    fn begin_transfer_interruptible(
+        &self,
+        manifest: &OfferManifest,
+        entry: &OfferManifestEntry,
+        interrupted: Option<&AtomicBool>,
+    ) -> io::Result<TransferCredentials> {
         let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(&manifest.offer_id.0);
         payload.extend_from_slice(&entry.file_id.0);
         payload.extend_from_slice(&random_bytes::<32>()?);
-        let response = self.command(Opcode::BeginTransfer, payload)?;
+        let response =
+            self.command_recovering(Opcode::BeginTransfer, payload, interrupted, None)?;
         require_ok(&response)?;
         if response.len() != 121 {
             return Err(invalid_data("invalid BeginTransfer response"));
@@ -1400,11 +1586,13 @@ impl SecureOfferClient {
         Ok(credentials)
     }
 
-    fn read_range(
+    fn read_range_interruptible(
         &self,
         credentials: TransferCredentials,
         offset: u64,
         requested: usize,
+        interrupted: Option<&AtomicBool>,
+        suspended: Option<&AtomicBool>,
     ) -> io::Result<(TransferStatus, Vec<u8>)> {
         if requested > MAX_SECURE_RANGE_BYTES {
             return Err(invalid_data("secure range exceeds client limit"));
@@ -1416,7 +1604,8 @@ impl SecureOfferClient {
                 .map_err(invalid_crypto)?
                 .to_be_bytes(),
         );
-        let response = self.command(Opcode::ReadRange, payload)?;
+        let response =
+            self.command_recovering(Opcode::ReadRange, payload, interrupted, suspended)?;
         let status = decode_transfer_status(&response)?;
         if response.len() < 14 {
             return Err(invalid_data("truncated ReadRange response"));
@@ -1435,6 +1624,28 @@ impl SecureOfferClient {
         sequence: u64,
         opcode: Opcode,
     ) -> io::Result<TransferStatus> {
+        self.control_interruptible(credentials, sequence, opcode, None)
+    }
+
+    fn control_interruptible(
+        &self,
+        credentials: TransferCredentials,
+        sequence: u64,
+        opcode: Opcode,
+        interrupted: Option<&AtomicBool>,
+    ) -> io::Result<TransferStatus> {
+        let mut payload = credentials.encode();
+        payload.extend_from_slice(&sequence.to_be_bytes());
+        let response = self.command_recovering(opcode, payload, interrupted, None)?;
+        decode_transfer_status(&response)
+    }
+
+    fn control_once(
+        &self,
+        credentials: TransferCredentials,
+        sequence: u64,
+        opcode: Opcode,
+    ) -> io::Result<TransferStatus> {
         let mut payload = credentials.encode();
         payload.extend_from_slice(&sequence.to_be_bytes());
         let response = self.command(opcode, payload)?;
@@ -1444,6 +1655,82 @@ impl SecureOfferClient {
     fn status(&self, credentials: TransferCredentials) -> io::Result<TransferStatus> {
         let response = self.command(Opcode::Status, credentials.encode())?;
         decode_transfer_status(&response)
+    }
+
+    fn command_recovering(
+        &self,
+        opcode: Opcode,
+        payload: Vec<u8>,
+        interrupted: Option<&AtomicBool>,
+        suspended: Option<&AtomicBool>,
+    ) -> io::Result<Vec<u8>> {
+        if self.recovery_policy.max_elapsed.is_zero() {
+            return self.command(opcode, payload);
+        }
+        let mut deadline = Instant::now()
+            .checked_add(self.recovery_policy.max_elapsed)
+            .unwrap_or(Instant::now());
+        let mut delay = self.recovery_policy.initial_backoff;
+        let mut active_recovery = None;
+        let mut attempts = 0_u64;
+        loop {
+            if attempts != 0 {
+                wait_recovery_gate(&mut deadline, interrupted, suspended)?;
+            }
+            if interrupted.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "secure network recovery was cancelled",
+                ));
+            }
+            match self.command(opcode, payload.clone()) {
+                Ok(response) => {
+                    if attempts != 0 {
+                        self.recovery_metrics
+                            .recovered_commands
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(response);
+                }
+                Err(error) if !is_recoverable_network_error(&error) => return Err(error),
+                Err(error) => {
+                    self.recovery_metrics
+                        .transient_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    active_recovery.get_or_insert_with(|| self.recovery_metrics.begin_recovery());
+                    if Instant::now() >= deadline {
+                        self.recovery_metrics
+                            .exhausted_commands
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "secure network recovery exhausted after {attempts} reconnect attempts: {error}"
+                            ),
+                        ));
+                    }
+                    attempts = attempts.saturating_add(1);
+                    self.recovery_metrics
+                        .reconnect_attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    sleep_recovery_delay(delay, deadline, interrupted)?;
+                    if Instant::now() >= deadline {
+                        self.recovery_metrics
+                            .exhausted_commands
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "secure network recovery exhausted after {attempts} reconnect attempts: {error}"
+                            ),
+                        ));
+                    }
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(self.recovery_policy.max_backoff);
+                }
+            }
+        }
     }
 
     fn command(&self, opcode: Opcode, payload: Vec<u8>) -> io::Result<Vec<u8>> {
@@ -1477,7 +1764,12 @@ impl SecureOfferClient {
     }
 
     fn connect(&self) -> io::Result<SecureCommandConnection> {
-        let mut stream = self.tls.connect(self.address)?;
+        let mut stream = if self.recovery_policy.max_elapsed.is_zero() {
+            self.tls.connect(self.address)?
+        } else {
+            self.tls
+                .connect_with_timeout(self.address, self.recovery_policy.connect_attempt_timeout)?
+        };
         let hello_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let mut hello = Vec::with_capacity(33);
         hello.push(HELLO_ROLE_RECEIVER);
@@ -1524,6 +1816,81 @@ impl SecureOfferClient {
         }
         Ok(response.payload)
     }
+}
+
+fn wait_recovery_gate(
+    deadline: &mut Instant,
+    interrupted: Option<&AtomicBool>,
+    suspended: Option<&AtomicBool>,
+) -> io::Result<()> {
+    let paused_at = Instant::now();
+    while suspended.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+        if interrupted.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "secure network recovery was cancelled",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    *deadline = deadline
+        .checked_add(paused_at.elapsed())
+        .unwrap_or(*deadline);
+    Ok(())
+}
+
+fn sleep_recovery_delay(
+    delay: Duration,
+    deadline: Instant,
+    interrupted: Option<&AtomicBool>,
+) -> io::Result<()> {
+    let wake_at = Instant::now()
+        .checked_add(delay)
+        .unwrap_or(deadline)
+        .min(deadline);
+    while Instant::now() < wake_at {
+        if interrupted.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "secure network recovery was cancelled",
+            ));
+        }
+        std::thread::sleep(
+            wake_at
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+    Ok(())
+}
+
+fn is_recoverable_network_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+    ) || matches!(
+        error.raw_os_error(),
+        Some(
+            53      // ERROR_BAD_NETPATH
+                | 64 // ERROR_NETNAME_DELETED
+                | 121 // ERROR_SEM_TIMEOUT
+                | 10050 // WSAENETDOWN
+                | 10051 // WSAENETUNREACH
+                | 10052 // WSAENETRESET
+                | 10053 // WSAECONNABORTED
+                | 10054 // WSAECONNRESET
+                | 10060 // WSAETIMEDOUT
+                | 10061 // WSAECONNREFUSED
+                | 10064 // WSAEHOSTDOWN
+                | 10065 // WSAEHOSTUNREACH
+        )
+    )
 }
 
 pub struct SecureRemoteSource {
@@ -1601,7 +1968,11 @@ impl SecureRemoteSource {
         if let Some(credentials) = *transfer {
             return Ok(credentials);
         }
-        let credentials = self.client.begin_transfer(&self.manifest, &self.entry)?;
+        let credentials = self.client.begin_transfer_interruptible(
+            &self.manifest,
+            &self.entry,
+            Some(&self.group_cancelled),
+        )?;
         *transfer = Some(credentials);
         drop(transfer);
         if self.group_cancelled.load(Ordering::Acquire) {
@@ -1678,7 +2049,22 @@ impl SecureRemoteSource {
 
     fn send_control(&self, opcode: Opcode) -> io::Result<TransferStatus> {
         let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
-        self.client.control(self.credentials()?, sequence, opcode)
+        let interrupted = (opcode != Opcode::Cancel).then_some(&*self.group_cancelled);
+        self.client
+            .control_interruptible(self.credentials()?, sequence, opcode, interrupted)
+    }
+
+    fn cancel_local_first(&self) -> io::Result<TransferStatus> {
+        let credentials = self
+            .transfer
+            .lock()
+            .map_err(|_| io::Error::other("remote transfer lock poisoned"))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "transfer has not started")
+            })?;
+        let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
+        self.client
+            .control_once(credentials, sequence, Opcode::Cancel)
     }
 
     #[must_use]
@@ -1711,6 +2097,7 @@ pub struct TransferGroupStatus {
     pub unique_bytes: u64,
     pub read_calls: u64,
     pub bytes_read: u64,
+    pub remote_acknowledged: bool,
 }
 
 impl RemoteTransferRegistry {
@@ -1842,10 +2229,24 @@ impl RemoteTransferRegistry {
         let sources = self.started_sources()?;
         self.group_cancelled.store(true, Ordering::Release);
         self.group_paused.store(false, Ordering::Release);
+        let mut unique_bytes = 0_u64;
+        let mut remote_acknowledged = true;
         for source in &sources {
-            source.cancel()?;
+            if let Ok(status) = source.cancel_local_first() {
+                unique_bytes = unique_bytes.saturating_add(status.unique_bytes);
+            } else {
+                remote_acknowledged = false;
+                unique_bytes = unique_bytes.saturating_add(source.bytes_read());
+            }
         }
-        Self::aggregate(&sources)
+        Ok(TransferGroupStatus {
+            state: RemoteTransferState::Cancelled,
+            started_transfers: sources.len(),
+            unique_bytes,
+            read_calls: sources.iter().map(|source| source.read_calls()).sum(),
+            bytes_read: sources.iter().map(|source| source.bytes_read()).sum(),
+            remote_acknowledged,
+        })
     }
 
     /// Returns aggregate progress for all file streams that have started in this paste operation.
@@ -1887,6 +2288,7 @@ impl RemoteTransferRegistry {
             unique_bytes,
             read_calls,
             bytes_read,
+            remote_acknowledged: true,
         })
     }
 
@@ -1895,6 +2297,19 @@ impl RemoteTransferRegistry {
         self.sources
             .lock()
             .map(|sources| sources.len())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn recovery_snapshot(&self) -> SecureRecoverySnapshot {
+        self.sources
+            .lock()
+            .ok()
+            .and_then(|sources| {
+                sources
+                    .first()
+                    .map(|source| source.client.recovery_snapshot())
+            })
             .unwrap_or_default()
     }
 }
@@ -1923,7 +2338,13 @@ impl ReadAtSource for SecureRemoteSource {
         let bytes = loop {
             let (status, bytes) = self
                 .client
-                .read_range(credentials, offset, requested)
+                .read_range_interruptible(
+                    credentials,
+                    offset,
+                    requested,
+                    Some(&self.group_cancelled),
+                    Some(&self.group_paused),
+                )
                 .map_err(io_to_windows_error)?;
             if status.state == RemoteTransferState::Paused && bytes.is_empty() {
                 std::thread::sleep(Duration::from_millis(10));
@@ -1939,7 +2360,12 @@ impl ReadAtSource for SecureRemoteSource {
             && !self.completion_sent.swap(true, Ordering::AcqRel)
         {
             let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
-            if let Err(error) = self.client.control(credentials, sequence, Opcode::Complete) {
+            if let Err(error) = self.client.control_interruptible(
+                credentials,
+                sequence,
+                Opcode::Complete,
+                Some(&self.group_cancelled),
+            ) {
                 self.completion_sent.store(false, Ordering::Release);
                 return Err(io_to_windows_error(error));
             }
@@ -2360,6 +2786,19 @@ mod tests {
         (server, client, peers.other_client)
     }
 
+    fn recovering_client(client: &SecureOfferClient, max_elapsed: Duration) -> SecureOfferClient {
+        SecureOfferClient::with_recovery_policy(
+            client.address,
+            client.tls.clone(),
+            SecureRecoveryPolicy {
+                max_elapsed,
+                connect_attempt_timeout: Duration::from_millis(50),
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(40),
+            },
+        )
+    }
+
     #[test]
     fn offer_metadata_is_authenticated_and_content_is_deferred_until_read() {
         let (server, client, _) = start_generated(1024 * 1024);
@@ -2686,6 +3125,10 @@ mod tests {
             client.control(credentials, 1, Opcode::Pause).unwrap().state,
             RemoteTransferState::Paused
         );
+        assert_eq!(
+            client.control(credentials, 1, Opcode::Pause).unwrap().state,
+            RemoteTransferState::Paused
+        );
         let replay = client.control(credentials, 1, Opcode::Resume).unwrap_err();
         assert_eq!(replay.kind(), io::ErrorKind::PermissionDenied);
 
@@ -2699,7 +3142,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_begin_nonce_is_rejected_as_a_replay() {
+    fn repeated_begin_nonce_is_idempotent_for_the_same_offer() {
         let (server, client, _) = start_generated(4096);
         let manifest = client.fetch_manifest().unwrap();
         let mut payload = Vec::with_capacity(64);
@@ -2711,13 +3154,220 @@ mod tests {
             .command(Opcode::BeginTransfer, payload.clone())
             .unwrap();
         require_ok(&first).unwrap();
-        let replay = client.command(Opcode::BeginTransfer, payload).unwrap();
-        assert_eq!(
-            replay.first().copied(),
-            Some(ResponseStatus::Replay.encode())
+        let repeated = client.command(Opcode::BeginTransfer, payload).unwrap();
+        require_ok(&repeated).unwrap();
+        assert_eq!(&first[..113], &repeated[..113]);
+        assert!(
+            u64::from_be_bytes(array_at_io(&repeated, 113).unwrap())
+                <= u64::from_be_bytes(array_at_io(&first, 113).unwrap())
         );
         assert_eq!(server.metrics().begun_transfers, 1);
-        assert_eq!(server.metrics().replayed_requests, 1);
+        assert_eq!(server.metrics().replayed_requests, 0);
+    }
+
+    #[test]
+    fn lost_begin_response_reconnects_without_creating_a_second_session() {
+        let (server, base_client, _) = start_generated(4096);
+        let client = recovering_client(&base_client, Duration::from_secs(1));
+        let manifest = client.fetch_manifest().unwrap();
+        server.inject_response_drops(1);
+
+        let source = SecureRemoteSource::new(client.clone(), manifest);
+        let credentials = source.credentials_for_test().unwrap();
+        assert_ne!(credentials.transfer_id.0, [0; 16]);
+
+        let server_metrics = server.metrics();
+        let recovery = client.recovery_snapshot();
+        assert_eq!(server_metrics.begun_transfers, 1);
+        assert_eq!(server_metrics.replayed_requests, 0);
+        assert_eq!(recovery.reconnect_attempts, 1);
+        assert_eq!(recovery.recovered_commands, 1);
+        assert_eq!(recovery.exhausted_commands, 0);
+    }
+
+    #[test]
+    fn lost_range_response_retries_the_same_offset_without_double_counting_progress() {
+        let (server, base_client, _) = start_generated(4096);
+        let client = recovering_client(&base_client, Duration::from_secs(1));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client.clone(), manifest);
+        source.credentials_for_test().unwrap();
+        server.inject_response_drops(1);
+
+        let mut bytes = [0_u8; 4096];
+        assert_eq!(source.read_at(0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(bytes[0], generated_byte(0));
+        assert_eq!(bytes[4095], generated_byte(4095));
+
+        let server_metrics = server.metrics();
+        let recovery = client.recovery_snapshot();
+        assert_eq!(server_metrics.read_requests, 2);
+        assert_eq!(server_metrics.served_bytes, 8192);
+        assert_eq!(server_metrics.unique_bytes, 4096);
+        assert_eq!(source.bytes_read(), 4096);
+        assert_eq!(recovery.recovered_commands, 1);
+    }
+
+    #[test]
+    fn lost_control_response_reuses_the_same_sequence_idempotently() {
+        let (server, base_client, _) = start_generated(4096);
+        let client = recovering_client(&base_client, Duration::from_secs(1));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client.clone(), manifest);
+        let mut byte = [0_u8; 1];
+        source.read_at(0, &mut byte).unwrap();
+
+        server.inject_response_drops(1);
+        assert_eq!(source.pause().unwrap().state, RemoteTransferState::Paused);
+        server.inject_response_drops(1);
+        assert_eq!(source.resume().unwrap().state, RemoteTransferState::Running);
+        server.inject_response_drops(1);
+        assert_eq!(
+            source.complete().unwrap().state,
+            RemoteTransferState::Completed
+        );
+
+        assert_eq!(server.metrics().replayed_requests, 0);
+        assert_eq!(client.recovery_snapshot().recovered_commands, 3);
+    }
+
+    #[test]
+    fn recovery_exhaustion_is_bounded_and_maps_to_a_windows_timeout() {
+        let (mut server, base_client, _) =
+            start_generated_with_timeouts(4096, Duration::from_secs(2), Duration::from_millis(100));
+        let client = recovering_client(&base_client, Duration::from_millis(150));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client.clone(), manifest);
+        source.credentials_for_test().unwrap();
+        server.stop();
+
+        let started = Instant::now();
+        let mut bytes = [0_u8; 32];
+        let error = source.read_at(0, &mut bytes).unwrap_err();
+        assert_eq!(error.code(), HRESULT::from_win32(ERROR_TIMEOUT.0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let recovery = client.recovery_snapshot();
+        assert!(recovery.reconnect_attempts >= 2);
+        assert_eq!(recovery.recovered_commands, 0);
+        assert_eq!(recovery.exhausted_commands, 1);
+        assert_eq!(recovery.active_recoveries, 0);
+    }
+
+    #[test]
+    fn cancellation_interrupts_an_active_network_recovery_wait() {
+        let (mut server, base_client, _) =
+            start_generated_with_timeouts(4096, Duration::from_secs(2), Duration::from_millis(100));
+        let client = recovering_client(&base_client, Duration::from_secs(2));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = Arc::new(SecureRemoteSource::new(client.clone(), manifest));
+        source.credentials_for_test().unwrap();
+        server.stop();
+
+        let worker_source = Arc::clone(&source);
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 32];
+            worker_source.read_at(0, &mut bytes)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.recovery_snapshot().active_recoveries == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.recovery_snapshot().active_recoveries, 1);
+        source.group_cancelled.store(true, Ordering::Release);
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code(), HRESULT::from_win32(ERROR_CANCELLED.0));
+        assert_eq!(client.recovery_snapshot().active_recoveries, 0);
+        assert_eq!(client.recovery_snapshot().exhausted_commands, 0);
+    }
+
+    #[test]
+    fn paused_transfer_survives_a_lost_data_connection_and_resumes() {
+        let (server, base_client, _) =
+            start_generated_with_timeouts(4096, Duration::from_secs(2), Duration::from_millis(25));
+        let client = recovering_client(&base_client, Duration::from_secs(1));
+        let manifest = client.fetch_manifest().unwrap();
+        let source = Arc::new(SecureRemoteSource::new(client.clone(), manifest));
+        let mut first = [0_u8; 1];
+        source.read_at(0, &mut first).unwrap();
+        assert_eq!(source.pause().unwrap().state, RemoteTransferState::Paused);
+        server.inject_response_drops(1);
+
+        let worker_source = Arc::clone(&source);
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 32];
+            worker_source
+                .read_at(1, &mut bytes)
+                .map(|read| (read, bytes))
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.metrics().accepted_connections < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(server.metrics().accepted_connections >= 3);
+        assert_eq!(source.status().unwrap().state, RemoteTransferState::Paused);
+        assert_eq!(source.resume().unwrap().state, RemoteTransferState::Running);
+
+        let (read, bytes) = worker.join().unwrap().unwrap();
+        assert_eq!(read, bytes.len());
+        assert_eq!(bytes[0], generated_byte(1));
+        assert_eq!(client.recovery_snapshot().recovered_commands, 1);
+        assert_eq!(client.recovery_snapshot().exhausted_commands, 0);
+    }
+
+    #[test]
+    fn group_cancel_returns_locally_when_the_source_is_offline() {
+        let (mut server, base_client, _) =
+            start_generated_with_timeouts(4096, Duration::from_secs(2), Duration::from_millis(100));
+        let client = recovering_client(&base_client, Duration::from_secs(2));
+        let manifest = client.fetch_manifest().unwrap();
+        let registry = Arc::new(RemoteTransferRegistry::default());
+        let source = registry.create_source(client.clone(), manifest);
+        source.credentials_for_test().unwrap();
+        server.stop();
+
+        let worker_source = Arc::clone(&source);
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 32];
+            worker_source.read_at(0, &mut bytes)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.recovery_snapshot().active_recoveries == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.recovery_snapshot().active_recoveries, 1);
+
+        let started = Instant::now();
+        let cancelled = registry.cancel_all().unwrap();
+        assert_eq!(cancelled.state, RemoteTransferState::Cancelled);
+        assert!(!cancelled.remote_acknowledged);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code(), HRESULT::from_win32(ERROR_CANCELLED.0));
+        assert_eq!(client.recovery_snapshot().active_recoveries, 0);
+    }
+
+    #[test]
+    fn expired_sessions_are_cleaned_without_a_later_begin_request() {
+        let (server, client, _) = start_generated_with_timeouts(
+            4096,
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client, manifest);
+        source.credentials_for_test().unwrap();
+        assert_eq!(server.state.inner.lock().unwrap().transfers.len(), 1);
+        assert_eq!(server.state.inner.lock().unwrap().begin_nonces.len(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !server.state.inner.lock().unwrap().transfers.is_empty() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let inner = server.state.inner.lock().unwrap();
+        assert!(inner.transfers.is_empty());
+        assert!(inner.begin_nonces.is_empty());
     }
 
     #[test]
@@ -3031,10 +3681,10 @@ mod tests {
         drop(stream);
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while server.metrics().protocol_errors == 0 && Instant::now() < deadline {
+        while server.workers.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(server.metrics().protocol_errors >= 1);
+        assert_eq!(server.metrics().protocol_errors, 0);
         assert_eq!(
             client.fetch_manifest().unwrap().entries[0].descriptor.size,
             4096

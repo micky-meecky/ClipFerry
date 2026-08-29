@@ -3,6 +3,7 @@ param(
     [string]$ExecutablePath,
     [string]$DataRoot,
     [switch]$Stage6,
+    [switch]$Stage7,
     [switch]$SelfTest
 )
 
@@ -16,17 +17,21 @@ if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
     $ExecutablePath = Join-Path $PSScriptRoot 'clipferry.exe'
 }
 if ([string]::IsNullOrWhiteSpace($DataRoot)) {
-    $stageDirectory = if ($Stage6) { 'Stage6Test' } else { 'Stage5Test' }
+    # Stage 7 intentionally reuses the Stage 6 device store so the already verified pairing
+    # remains valid after upgrading the test executable.
+    $stageDirectory = if ($Stage6 -or $Stage7) { 'Stage6Test' } else { 'Stage5Test' }
     $DataRoot = Join-Path $env:LOCALAPPDATA "ClipFerry\$stageDirectory"
 }
 
-$script:ExpectedExecutableSha256 = '17C173EED47630C3C2D9D4E18ED9A196268226229902A53EFB1B41980C2440B7'
-$script:ConfigPath = Join-Path $DataRoot $(if ($Stage6) { 'stage6-menu.json' } else { 'stage5-menu.json' })
+$script:IsTreeStage = $Stage6 -or $Stage7
+$script:ExpectedExecutableSha256 = 'D6E40676A0D7404B9AC4F3F8B70C1DD4CDE3F4BA972386FF3FE41E56624F3030'
+$configName = if ($Stage7) { 'stage7-menu.json' } elseif ($Stage6) { 'stage6-menu.json' } else { 'stage5-menu.json' }
+$script:ConfigPath = Join-Path $DataRoot $configName
 $script:SourceRoot = Join-Path $DataRoot 'source'
 $script:ReceiveRoot = Join-Path $DataRoot 'receive'
-$script:Stage6TreeName = 'ClipFerry-Stage6-Tree'
-$script:DefaultSource = if ($Stage6) {
-    Join-Path $script:SourceRoot $script:Stage6TreeName
+$script:TreeName = if ($Stage7) { 'ClipFerry-Stage7-Recovery-2x512MiB' } else { 'ClipFerry-Stage6-Tree' }
+$script:DefaultSource = if ($script:IsTreeStage) {
+    Join-Path $script:SourceRoot $script:TreeName
 }
 else {
     Join-Path $script:SourceRoot 'ClipFerry-Stage5-Test.txt'
@@ -72,7 +77,7 @@ function New-DefaultConfig {
         PeerAddress = ''
         Port = '45232'
         LastSourceFile = $script:DefaultSource
-        LastReceiveTree = (Join-Path $script:ReceiveRoot $script:Stage6TreeName)
+        LastReceiveTree = (Join-Path $script:ReceiveRoot $script:TreeName)
         LastPeerFingerprint = ''
     }
 }
@@ -167,7 +172,21 @@ function Write-DeterministicFile {
 }
 
 function Initialize-Stage6Tree {
-    if (-not $Stage6) {
+    if (-not $script:IsTreeStage) {
+        return
+    }
+    if ($Stage7) {
+        [System.IO.Directory]::CreateDirectory($script:DefaultSource) | Out-Null
+        $first = Join-Path $script:DefaultSource 'large-a.bin'
+        $second = Join-Path $script:DefaultSource 'large-b.bin'
+        Write-Host '正在准备阶段 7 固定样本（首次约写入 512 MiB，请稍候）...' -ForegroundColor Yellow
+        Write-DeterministicFile -FilePath $first -SizeMiB 512 -Seed 7001
+        if (-not [System.IO.File]::Exists($second)) {
+            New-Item -ItemType HardLink -Path $second -Target $first | Out-Null
+        }
+        elseif ((Get-Item -LiteralPath $second).Length -ne (Get-Item -LiteralPath $first).Length) {
+            throw "阶段 7 样本长度异常，请检查：$second"
+        }
         return
     }
     $unicodeDirectory = Join-Path $script:DefaultSource '资料-🚢'
@@ -216,8 +235,8 @@ function Show-Stage6SourceManifest {
 }
 
 function Test-Stage6ReceivedTree {
-    if (-not $Stage6) {
-        throw '该功能仅用于阶段 6。'
+    if (-not $script:IsTreeStage) {
+        throw '该功能仅用于阶段 6/7。'
     }
     Initialize-Stage6Tree
     $config = Get-TestConfig
@@ -239,7 +258,7 @@ function Initialize-Device {
     [System.IO.Directory]::CreateDirectory($DataRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($script:SourceRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($script:ReceiveRoot) | Out-Null
-    if ($Stage6) {
+    if ($script:IsTreeStage) {
         Initialize-Stage6Tree
     }
     elseif (-not [System.IO.File]::Exists($script:DefaultSource)) {
@@ -402,7 +421,7 @@ function Start-SecureSource {
     $sourcePath = Read-Value -Prompt '源文件路径' -DefaultValue $config.LastSourceFile
     $sourcePath = (Resolve-Path -LiteralPath $sourcePath).ProviderPath
     $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-    if ($sourceItem.PSIsContainer -and -not $Stage6) {
+    if ($sourceItem.PSIsContainer -and -not $script:IsTreeStage) {
         throw '阶段 5 当前仍只验收单文件。'
     }
     $config.ListenIp = $ip
@@ -411,7 +430,7 @@ function Start-SecureSource {
     Save-TestConfig -Config $config
 
     Write-Host ''
-    if ($Stage6) {
+    if ($script:IsTreeStage) {
         Write-Host '源端将只发布目录清单；看到 READY 前不应读取文件内容。' -ForegroundColor Yellow
         Get-TreeManifest -RootPath $sourcePath | ForEach-Object { Write-Host $_ }
         Write-Host ''
@@ -438,8 +457,8 @@ function Read-PeerAddress {
 }
 
 function Start-SecureFetch {
-    if ($Stage6) {
-        throw '阶段 6 的目录树请使用 [B] Explorer 原生粘贴，再用 [V] 逐项核对。'
+    if ($script:IsTreeStage) {
+        throw '阶段 6/7 的目录树请使用 [B] Explorer 原生粘贴，再用 [V] 逐项核对。'
     }
     Initialize-Device
     $fingerprint = Select-TrustedPeer
@@ -463,11 +482,18 @@ function Start-SecureReceiver {
     $address = Read-PeerAddress -Config $config
     Write-Host ''
     Write-Host '看到 READY 后，在资源管理器空目录按 Ctrl+V。控制命令：status / pause / resume / cancel / quit' -ForegroundColor Yellow
-    Invoke-ClipFerry -Arguments @(
+    if ($Stage7) {
+        Write-Host '传输开始后让本机网络断开 10 到 20 秒，再恢复同一个局域网；不要关闭本窗口。' -ForegroundColor Yellow
+        Write-Host '恢复后等待粘贴完成，再输入 status；应看到 reconnect_attempts/recovered_commands 大于 0。' -ForegroundColor Yellow
+    }
+    $arguments = @(
         'secure-receiver-test', '--connect', $address,
         '--store', $DataRoot, '--peer-fingerprint', $fingerprint,
-        '--io-timeout-seconds', '30', '--async-mode', '--lifetime-seconds', '3600'
+        '--io-timeout-seconds', $(if ($Stage7) { '5' } else { '30' }),
+        '--recovery-seconds', $(if ($Stage7) { '180' } else { '120' }),
+        '--async-mode', '--lifetime-seconds', '3600'
     )
+    Invoke-ClipFerry -Arguments $arguments
 }
 
 function Show-Diagnostics {
@@ -485,7 +511,10 @@ function Show-Diagnostics {
 
 function Show-Menu {
     Clear-Host
-    if ($Stage6) {
+    if ($Stage7) {
+        Write-Host '# ClipFerry 阶段 7：短断网重连与按 offset 续传验收' -ForegroundColor Cyan
+    }
+    elseif ($Stage6) {
         Write-Host '# ClipFerry 阶段 6：多文件与文件夹验收' -ForegroundColor Cyan
     }
     else {
@@ -493,7 +522,10 @@ function Show-Menu {
     }
     Write-Host ''
     Write-Host '首次配对：两端 1 -> 主机 2 -> 从机 3 -> 核对同一 verify_code -> 两端输入 YES'
-    if ($Stage6) {
+    if ($Stage7) {
+        Write-Host '重连复核：主机 A -> 从机 B -> Ctrl+V -> 断网 10~20 秒 -> 恢复网络 -> 从机 V'
+    }
+    elseif ($Stage6) {
         Write-Host '目录树复核：主机 A -> 从机 B -> Explorer Ctrl+V -> 从机 V'
     }
     else {
@@ -507,7 +539,7 @@ function Show-Menu {
     Write-Host '[5] 撤销一个已配对设备'
     Write-Host '[A] 启动安全源端'
     Write-Host '[B] 启动 Explorer 接收端'
-    if ($Stage6) {
+    if ($script:IsTreeStage) {
         Write-Host '[C] 显示固定测试树及哈希'
         Write-Host '[V] 核对粘贴后的完整目录树'
     }

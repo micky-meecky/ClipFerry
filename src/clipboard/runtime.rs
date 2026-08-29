@@ -1124,16 +1124,28 @@ fn spawn_secure_receiver_control(
                         continue;
                     }
                 };
+                let recovery = registry.recovery_snapshot();
                 match result {
                     Ok(status) => println!(
-                        "CONTROL state={:?} streams={} unique_bytes={} read_calls={} bytes_read={}",
+                        "CONTROL state={:?} streams={} unique_bytes={} read_calls={} bytes_read={} remote_acknowledged={} recovery_active={} reconnect_attempts={} recovered_commands={} recovery_exhausted={}",
                         status.state,
                         status.started_transfers,
                         status.unique_bytes,
                         status.read_calls,
-                        status.bytes_read
+                        status.bytes_read,
+                        status.remote_acknowledged,
+                        recovery.active_recoveries,
+                        recovery.reconnect_attempts,
+                        recovery.recovered_commands,
+                        recovery.exhausted_commands
                     ),
-                    Err(error) => eprintln!("CONTROL command={command} error={error}"),
+                    Err(error) => eprintln!(
+                        "CONTROL command={command} error={error} recovery_active={} reconnect_attempts={} recovered_commands={} recovery_exhausted={}",
+                        recovery.active_recoveries,
+                        recovery.reconnect_attempts,
+                        recovery.recovered_commands,
+                        recovery.exhausted_commands
+                    ),
                 }
                 let _ = std::io::stdout().flush();
             }

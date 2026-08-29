@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::str::FromStr as _;
 use std::time::Duration;
 
-use clipferry::clipboard::secure_transfer::SecureOfferClient;
+use clipferry::clipboard::secure_transfer::{SecureOfferClient, SecureRecoveryPolicy};
 use clipferry::clipboard::{
     ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
     SecureFetchProbeOptions, SecureReceiverProbeOptions, SecureSourceProbeOptions, SecureSourceTls,
@@ -248,10 +248,10 @@ fn print_usage() {
         "  clipferry secure-source-test --listen <private-ip:port> --file <file-or-directory> [--file <additional-path> ...] --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--offer-ttl-seconds <seconds>] [--transfer-ttl-seconds <seconds>] [--io-timeout-seconds <seconds>] [--lifetime-seconds <seconds>]"
     );
     println!(
-        "  clipferry secure-fetch-test --connect <private-ip:port> --output <new-path> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>]"
+        "  clipferry secure-fetch-test --connect <private-ip:port> --output <new-path> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>] [--recovery-seconds <0..3600>]"
     );
     println!(
-        "  clipferry secure-receiver-test --connect <private-ip:port> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
+        "  clipferry secure-receiver-test --connect <private-ip:port> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>] [--recovery-seconds <0..3600>] [--async-mode] [--lifetime-seconds <seconds>]"
     );
     println!(
         "  For secure-*-test, --store <directory> --peer-fingerprint <SHA-256> replaces the three DER path options"
@@ -479,6 +479,7 @@ struct ParsedSecureClient {
     connect_address: std::net::SocketAddr,
     output_path: Option<std::path::PathBuf>,
     io_timeout: Duration,
+    recovery_window: Duration,
     lifetime: Option<Duration>,
     async_mode: bool,
     tls: TlsCliFiles,
@@ -650,6 +651,7 @@ fn parse_secure_client_options(
     let mut connect_address = None;
     let mut output_path = None;
     let mut io_timeout_seconds = 30_u64;
+    let mut recovery_seconds = 120_u64;
     let mut lifetime = None;
     let mut async_mode = false;
     let mut tls = TlsCliFiles::default();
@@ -663,6 +665,9 @@ fn parse_secure_client_options(
             }
             "--io-timeout-seconds" => {
                 io_timeout_seconds = parse_value(&mut arguments, &argument)?;
+            }
+            "--recovery-seconds" => {
+                recovery_seconds = parse_value(&mut arguments, &argument)?;
             }
             "--lifetime-seconds" if !allow_output => {
                 lifetime = Some(Duration::from_secs(parse_value(&mut arguments, &argument)?));
@@ -689,6 +694,9 @@ fn parse_secure_client_options(
     if io_timeout_seconds == 0 {
         return Err("--io-timeout-seconds must be greater than zero".to_owned());
     }
+    if recovery_seconds > 3600 {
+        return Err("--recovery-seconds must be between 0 and 3600".to_owned());
+    }
     if allow_output && output_path.is_none() {
         return Err("--output is required".to_owned());
     }
@@ -696,6 +704,7 @@ fn parse_secure_client_options(
         connect_address: connect_address.ok_or_else(|| "--connect is required".to_owned())?,
         output_path,
         io_timeout: Duration::from_secs(io_timeout_seconds),
+        recovery_window: Duration::from_secs(recovery_seconds),
         lifetime,
         async_mode,
         tls,
@@ -722,7 +731,16 @@ fn build_secure_client(parsed: &ParsedSecureClient) -> Result<SecureOfferClient,
         parsed.io_timeout,
     )
     .map_err(|error| format!("TLS client configuration failed: {error}"))?;
-    Ok(SecureOfferClient::new(parsed.connect_address, tls))
+    Ok(SecureOfferClient::with_recovery_policy(
+        parsed.connect_address,
+        tls,
+        SecureRecoveryPolicy {
+            max_elapsed: parsed.recovery_window,
+            connect_attempt_timeout: Duration::from_secs(2),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+        },
+    ))
 }
 
 fn parse_path(

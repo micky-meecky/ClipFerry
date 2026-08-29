@@ -208,7 +208,26 @@ impl PinnedTlsClient {
         address: SocketAddr,
     ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
         let socket = TcpStream::connect_timeout(&address, self.timeout)?;
-        self.connect_socket(socket)
+        self.connect_socket_with_timeout(socket, self.timeout)
+    }
+
+    /// Connects with a shorter per-attempt bound while preserving the configured certificate pins.
+    /// This lets a higher-level recovery loop remain responsive during a temporary outage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero timeout, TCP, TLS, ALPN, or certificate verification failure.
+    pub fn connect_with_timeout(
+        &self,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
+        if timeout.is_zero() {
+            return Err(invalid_data("TLS connection timeout must be non-zero"));
+        }
+        let timeout = timeout.min(self.timeout);
+        let socket = TcpStream::connect_timeout(&address, timeout)?;
+        self.connect_socket_with_timeout(socket, timeout)
     }
 
     /// Completes pinned mutual TLS on an already-connected socket.
@@ -221,9 +240,17 @@ impl PinnedTlsClient {
     /// Returns an error for socket, timeout, TLS, ALPN, or certificate verification failures.
     pub fn connect_socket(
         &self,
-        mut socket: TcpStream,
+        socket: TcpStream,
     ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
-        configure_socket(&socket, self.timeout)?;
+        self.connect_socket_with_timeout(socket, self.timeout)
+    }
+
+    fn connect_socket_with_timeout(
+        &self,
+        mut socket: TcpStream,
+        timeout: Duration,
+    ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
+        configure_socket(&socket, timeout)?;
         let server_name = ServerName::try_from(SERVER_NAME)
             .map_err(invalid_crypto)?
             .to_owned();
