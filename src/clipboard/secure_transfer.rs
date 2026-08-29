@@ -11,7 +11,11 @@ use windows::Win32::Foundation::{
 };
 use windows::core::{Error, HRESULT, Result};
 
-use crate::security::{PinnedTlsClient, PinnedTlsServer};
+use crate::device_store::DeviceStore;
+use crate::security::{
+    AuthenticatedServerConnection, CertificateFingerprint, PinnedTlsClient, PinnedTlsServer,
+    TrustedTlsServer,
+};
 
 use super::data_object::{VirtualFileDescriptor, validate_virtual_file_name};
 use super::local_file::LocalFileOffer;
@@ -290,6 +294,7 @@ struct TransferInner {
 }
 
 struct TransferSession {
+    authorized_peer: CertificateFingerprint,
     offer_id: ProtocolId,
     file_id: ProtocolId,
     transfer_id: ProtocolId,
@@ -325,6 +330,8 @@ struct ServerInner {
 
 struct ServerState {
     offered: SecureOfferedFile,
+    authorized_peer: CertificateFingerprint,
+    trust_store: Option<DeviceStore>,
     transfer_ttl: Duration,
     request_timeout: Duration,
     inner: Mutex<ServerInner>,
@@ -338,9 +345,11 @@ impl ServerState {
 
     fn begin_transfer(
         &self,
+        peer: CertificateFingerprint,
         offer_id: ProtocolId,
         nonce: [u8; 32],
     ) -> WireResult<TransferCredentials> {
+        self.ensure_peer_allowed(peer)?;
         let now = Instant::now();
         if offer_id != self.offered.manifest.offer_id || now >= self.offered.expires_at {
             return Err(ResponseStatus::Expired);
@@ -368,6 +377,7 @@ impl ServerState {
             .checked_add(self.transfer_ttl)
             .ok_or(ResponseStatus::Internal)?;
         let session = Arc::new(TransferSession {
+            authorized_peer: peer,
             offer_id,
             file_id: self.offered.manifest.file_id,
             transfer_id,
@@ -389,8 +399,10 @@ impl ServerState {
 
     fn authenticated_session(
         &self,
+        peer: CertificateFingerprint,
         credentials: &TransferCredentials,
     ) -> WireResult<Arc<TransferSession>> {
+        self.ensure_peer_allowed(peer)?;
         let inner = self.inner.lock().map_err(|_| ResponseStatus::Internal)?;
         let Some(session) = inner.transfers.get(&credentials.transfer_id) else {
             self.metrics.denied_requests.fetch_add(1, Ordering::Relaxed);
@@ -399,7 +411,8 @@ impl ServerState {
         if session.expires_at <= Instant::now() {
             return Err(ResponseStatus::Expired);
         }
-        if session.offer_id != credentials.offer_id
+        if session.authorized_peer != peer
+            || session.offer_id != credentials.offer_id
             || session.file_id != credentials.file_id
             || session.capability != credentials.capability
             || session.server_nonce != credentials.server_nonce
@@ -412,11 +425,12 @@ impl ServerState {
 
     fn control(
         &self,
+        peer: CertificateFingerprint,
         credentials: &TransferCredentials,
         sequence: u64,
         opcode: Opcode,
     ) -> WireResult<TransferStatus> {
-        let session = self.authenticated_session(credentials)?;
+        let session = self.authenticated_session(peer, credentials)?;
         let mut inner = session.inner.lock().map_err(|_| ResponseStatus::Internal)?;
         if sequence <= inner.last_control_sequence {
             self.metrics
@@ -458,8 +472,12 @@ impl ServerState {
         })
     }
 
-    fn status(&self, credentials: &TransferCredentials) -> WireResult<TransferStatus> {
-        let session = self.authenticated_session(credentials)?;
+    fn status(
+        &self,
+        peer: CertificateFingerprint,
+        credentials: &TransferCredentials,
+    ) -> WireResult<TransferStatus> {
+        let session = self.authenticated_session(peer, credentials)?;
         let inner = session.inner.lock().map_err(|_| ResponseStatus::Internal)?;
         Ok(TransferStatus {
             state: inner.state,
@@ -469,6 +487,7 @@ impl ServerState {
 
     fn read_range(
         &self,
+        peer: CertificateFingerprint,
         credentials: &TransferCredentials,
         offset: u64,
         requested: usize,
@@ -476,11 +495,19 @@ impl ServerState {
         if requested > MAX_SECURE_RANGE_BYTES {
             return Err(ResponseStatus::Invalid);
         }
-        let session = self.authenticated_session(credentials)?;
+        let session = self.authenticated_session(peer, credentials)?;
         self.metrics.read_requests.fetch_add(1, Ordering::Relaxed);
         let _active = self.metrics.begin_read();
         let mut inner = session.inner.lock().map_err(|_| ResponseStatus::Internal)?;
         while inner.state == RemoteTransferState::Paused {
+            if !self.peer_is_allowed(peer) {
+                inner.state = RemoteTransferState::Cancelled;
+                self.metrics
+                    .cancelled_transfers
+                    .fetch_add(1, Ordering::Relaxed);
+                session.changed.notify_all();
+                return Err(ResponseStatus::Denied);
+            }
             let now = Instant::now();
             if now >= session.expires_at {
                 return Err(ResponseStatus::Expired);
@@ -516,6 +543,8 @@ impl ServerState {
         }
         drop(inner);
 
+        self.ensure_peer_allowed(peer)?;
+
         let available = self.offered.manifest.descriptor.size.saturating_sub(offset);
         let count = usize::try_from(available.min(requested as u64)).unwrap_or(requested);
         let mut bytes = vec![0_u8; count];
@@ -527,6 +556,19 @@ impl ServerState {
         bytes.truncate(read);
 
         let mut inner = session.inner.lock().map_err(|_| ResponseStatus::Internal)?;
+        if !self.peer_is_allowed(peer) {
+            if matches!(
+                inner.state,
+                RemoteTransferState::Running | RemoteTransferState::Paused
+            ) {
+                inner.state = RemoteTransferState::Cancelled;
+                self.metrics
+                    .cancelled_transfers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            session.changed.notify_all();
+            return Err(ResponseStatus::Denied);
+        }
         if Instant::now() >= session.expires_at {
             return Err(ResponseStatus::Expired);
         }
@@ -560,6 +602,48 @@ impl ServerState {
             })
             .unwrap_or_default()
     }
+
+    fn ensure_peer_allowed(&self, peer: CertificateFingerprint) -> WireResult<()> {
+        if !self.peer_is_allowed(peer) {
+            self.metrics.denied_requests.fetch_add(1, Ordering::Relaxed);
+            self.cancel_peer_transfers(peer);
+            return Err(ResponseStatus::Denied);
+        }
+        Ok(())
+    }
+
+    fn peer_is_allowed(&self, peer: CertificateFingerprint) -> bool {
+        peer == self.authorized_peer
+            && self
+                .trust_store
+                .as_ref()
+                .is_none_or(|store| store.load_peer(peer).is_ok())
+    }
+
+    fn cancel_peer_transfers(&self, peer: CertificateFingerprint) {
+        let Ok(inner) = self.inner.lock() else {
+            return;
+        };
+        for transfer in inner
+            .transfers
+            .values()
+            .filter(|transfer| transfer.authorized_peer == peer)
+        {
+            let Ok(mut state) = transfer.inner.lock() else {
+                continue;
+            };
+            if matches!(
+                state.state,
+                RemoteTransferState::Running | RemoteTransferState::Paused
+            ) {
+                state.state = RemoteTransferState::Cancelled;
+                self.metrics
+                    .cancelled_transfers
+                    .fetch_add(1, Ordering::Relaxed);
+                transfer.changed.notify_all();
+            }
+        }
+    }
 }
 
 pub struct SecureOfferServer {
@@ -583,6 +667,59 @@ impl SecureOfferServer {
         transfer_ttl: Duration,
         request_timeout: Duration,
     ) -> io::Result<Self> {
+        let authorized_peer = tls.expected_peer();
+        Self::start_inner(
+            listen_address,
+            SecureServerTls::Pinned(tls),
+            authorized_peer,
+            None,
+            offered,
+            transfer_ttl,
+            request_timeout,
+        )
+    }
+
+    /// Starts a single-offer server that authenticates every currently trusted device but grants
+    /// this offer only to the explicitly selected peer. Trust is rechecked for each request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when arguments are invalid or the listener/thread cannot start.
+    pub fn start_trusted(
+        listen_address: SocketAddr,
+        tls: TrustedTlsServer,
+        authorized_peer: CertificateFingerprint,
+        offered: SecureOfferedFile,
+        transfer_ttl: Duration,
+        request_timeout: Duration,
+    ) -> io::Result<Self> {
+        let trust_store = tls.trust_store();
+        let peer = trust_store.load_peer(authorized_peer)?;
+        if peer.fingerprint != authorized_peer {
+            return Err(invalid_data(
+                "authorized peer record does not match its pin",
+            ));
+        }
+        Self::start_inner(
+            listen_address,
+            SecureServerTls::Trusted(tls),
+            authorized_peer,
+            Some(trust_store),
+            offered,
+            transfer_ttl,
+            request_timeout,
+        )
+    }
+
+    fn start_inner(
+        listen_address: SocketAddr,
+        tls: SecureServerTls,
+        authorized_peer: CertificateFingerprint,
+        trust_store: Option<DeviceStore>,
+        offered: SecureOfferedFile,
+        transfer_ttl: Duration,
+        request_timeout: Duration,
+    ) -> io::Result<Self> {
         if transfer_ttl.is_zero() || request_timeout.is_zero() {
             return Err(invalid_data("secure server timeouts must be non-zero"));
         }
@@ -591,6 +728,8 @@ impl SecureOfferServer {
         let address = listener.local_addr()?;
         let state = Arc::new(ServerState {
             offered,
+            authorized_peer,
+            trust_store,
             transfer_ttl,
             request_timeout,
             inner: Mutex::new(ServerInner {
@@ -645,6 +784,21 @@ impl SecureOfferServer {
     }
 }
 
+#[derive(Clone)]
+enum SecureServerTls {
+    Pinned(PinnedTlsServer),
+    Trusted(TrustedTlsServer),
+}
+
+impl SecureServerTls {
+    fn accept(&self, socket: TcpStream) -> io::Result<AuthenticatedServerConnection> {
+        match self {
+            Self::Pinned(tls) => tls.accept_authenticated(socket),
+            Self::Trusted(tls) => tls.accept(socket),
+        }
+    }
+}
+
 impl Drop for SecureOfferServer {
     fn drop(&mut self) {
         self.stop();
@@ -654,7 +808,7 @@ impl Drop for SecureOfferServer {
 #[allow(clippy::needless_pass_by_value)]
 fn secure_accept_loop(
     listener: TcpListener,
-    tls: PinnedTlsServer,
+    tls: SecureServerTls,
     state: Arc<ServerState>,
     stop: Arc<AtomicBool>,
     workers: Arc<AtomicUsize>,
@@ -682,19 +836,28 @@ fn secure_accept_loop(
                     .spawn(move || {
                         let _guard = WorkerCountGuard(worker_count);
                         match worker_tls.accept(socket) {
-                            Ok(mut stream) => {
-                                let result = stream
+                            Ok(mut authenticated) => {
+                                let result = authenticated
+                                    .stream
                                     .sock
                                     .set_read_timeout(Some(worker_state.connection_idle_timeout()))
                                     .and_then(|()| {
-                                        handle_secure_connection(&mut stream, &worker_state)
+                                        handle_secure_connection(
+                                            &mut authenticated.stream,
+                                            &worker_state,
+                                            authenticated.peer_fingerprint,
+                                        )
                                     });
                                 if let Err(error) = result {
-                                    eprintln!("SECURE connection_error={error}");
-                                    worker_state
-                                        .metrics
-                                        .protocol_errors
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    if error.kind() == io::ErrorKind::PermissionDenied {
+                                        eprintln!("SECURE connection_denied=true");
+                                    } else {
+                                        eprintln!("SECURE connection_error={error}");
+                                        worker_state
+                                            .metrics
+                                            .protocol_errors
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -736,7 +899,11 @@ impl Drop for WorkerCountGuard {
 fn handle_secure_connection(
     stream: &mut (impl io::Read + io::Write),
     state: &ServerState,
+    peer: CertificateFingerprint,
 ) -> io::Result<()> {
+    state
+        .ensure_peer_allowed(peer)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "peer is not authorized"))?;
     let hello = read_frame(stream)?;
     if hello.opcode != Opcode::Hello as u16
         || hello.payload.len() != 33
@@ -758,8 +925,11 @@ fn handle_secure_connection(
         let Some(request) = read_frame_optional(stream)? else {
             return Ok(());
         };
+        state.ensure_peer_allowed(peer).map_err(|_| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "peer trust was revoked")
+        })?;
         let opcode = Opcode::try_from(request.opcode)?;
-        let response = dispatch_request(state, opcode, &request.payload);
+        let response = dispatch_request(state, peer, opcode, &request.payload);
         write_frame(
             stream,
             Frame {
@@ -771,15 +941,20 @@ fn handle_secure_connection(
     }
 }
 
-fn dispatch_request(state: &ServerState, opcode: Opcode, payload: &[u8]) -> Vec<u8> {
+fn dispatch_request(
+    state: &ServerState,
+    peer: CertificateFingerprint,
+    opcode: Opcode,
+    payload: &[u8],
+) -> Vec<u8> {
     let result = match opcode {
         Opcode::GetOffer => encode_manifest_response(state, payload),
-        Opcode::BeginTransfer => encode_begin_response(state, payload),
-        Opcode::ReadRange => encode_read_response(state, payload),
+        Opcode::BeginTransfer => encode_begin_response(state, peer, payload),
+        Opcode::ReadRange => encode_read_response(state, peer, payload),
         Opcode::Pause | Opcode::Resume | Opcode::Cancel | Opcode::Complete => {
-            encode_control_response(state, opcode, payload)
+            encode_control_response(state, peer, opcode, payload)
         }
-        Opcode::Status => encode_status_response(state, payload),
+        Opcode::Status => encode_status_response(state, peer, payload),
         Opcode::Hello => Err(ResponseStatus::Invalid),
     };
     result.unwrap_or_else(|status| vec![status.encode()])
@@ -822,7 +997,11 @@ fn encode_manifest_response(state: &ServerState, payload: &[u8]) -> WireResult<V
     Ok(response)
 }
 
-fn encode_begin_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<u8>> {
+fn encode_begin_response(
+    state: &ServerState,
+    peer: CertificateFingerprint,
+    payload: &[u8],
+) -> WireResult<Vec<u8>> {
     if payload.len() != 48 {
         return Err(ResponseStatus::Invalid);
     }
@@ -831,7 +1010,7 @@ fn encode_begin_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<
     if nonce.iter().all(|byte| *byte == 0) {
         return Err(ResponseStatus::Invalid);
     }
-    let credentials = state.begin_transfer(offer_id, nonce)?;
+    let credentials = state.begin_transfer(peer, offer_id, nonce)?;
     let mut response = vec![ResponseStatus::Ok.encode()];
     response.extend_from_slice(&credentials.offer_id.0);
     response.extend_from_slice(&credentials.file_id.0);
@@ -842,7 +1021,11 @@ fn encode_begin_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<
     Ok(response)
 }
 
-fn encode_read_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<u8>> {
+fn encode_read_response(
+    state: &ServerState,
+    peer: CertificateFingerprint,
+    payload: &[u8],
+) -> WireResult<Vec<u8>> {
     if payload.len() != TransferCredentials::WIRE_LEN + 12 {
         return Err(ResponseStatus::Invalid);
     }
@@ -850,7 +1033,7 @@ fn encode_read_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<u
     let offset = u64::from_be_bytes(array_at(payload, TransferCredentials::WIRE_LEN)?);
     let requested = u32::from_be_bytes(array_at(payload, TransferCredentials::WIRE_LEN + 8)?);
     let requested = usize::try_from(requested).map_err(|_| ResponseStatus::Invalid)?;
-    let (status, bytes) = state.read_range(&credentials, offset, requested)?;
+    let (status, bytes) = state.read_range(peer, &credentials, offset, requested)?;
     let mut response = encode_transfer_status(status);
     response.extend_from_slice(
         &u32::try_from(bytes.len())
@@ -863,6 +1046,7 @@ fn encode_read_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<u
 
 fn encode_control_response(
     state: &ServerState,
+    peer: CertificateFingerprint,
     opcode: Opcode,
     payload: &[u8],
 ) -> WireResult<Vec<u8>> {
@@ -872,16 +1056,20 @@ fn encode_control_response(
     let credentials = TransferCredentials::decode(payload)?;
     let sequence = u64::from_be_bytes(array_at(payload, TransferCredentials::WIRE_LEN)?);
     state
-        .control(&credentials, sequence, opcode)
+        .control(peer, &credentials, sequence, opcode)
         .map(encode_transfer_status)
 }
 
-fn encode_status_response(state: &ServerState, payload: &[u8]) -> WireResult<Vec<u8>> {
+fn encode_status_response(
+    state: &ServerState,
+    peer: CertificateFingerprint,
+    payload: &[u8],
+) -> WireResult<Vec<u8>> {
     if payload.len() != TransferCredentials::WIRE_LEN {
         return Err(ResponseStatus::Invalid);
     }
     let credentials = TransferCredentials::decode(payload)?;
-    state.status(&credentials).map(encode_transfer_status)
+    state.status(peer, &credentials).map(encode_transfer_status)
 }
 
 fn encode_transfer_status(status: TransferStatus) -> Vec<u8> {
@@ -1470,6 +1658,7 @@ impl ResponseStatus {
 
 type WireResult<T> = std::result::Result<T, ResponseStatus>;
 
+#[derive(Debug)]
 struct Frame {
     opcode: u16,
     request_id: u64,
@@ -1615,8 +1804,10 @@ fn io_to_windows_error(error: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
+    use std::path::PathBuf;
 
     use rcgen::CertifiedKey;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -1630,6 +1821,39 @@ mod tests {
         server: PinnedTlsServer,
         client: PinnedTlsClient,
         other_client: PinnedTlsClient,
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let mut random = [0_u8; 8];
+            getrandom::fill(&mut random).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "clipferry-secure-{name}-{}-{}",
+                std::process::id(),
+                u64::from_le_bytes(random)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct TrustedTestPeers {
+        _server_directory: TestDirectory,
+        _authorized_directory: TestDirectory,
+        _other_directory: TestDirectory,
+        server_store: DeviceStore,
+        server: TrustedTlsServer,
+        authorized: PinnedTlsClient,
+        other: PinnedTlsClient,
+        authorized_fingerprint: CertificateFingerprint,
     }
 
     fn identity() -> (TlsIdentity, Vec<u8>) {
@@ -1675,6 +1899,59 @@ mod tests {
                 timeout,
             )
             .unwrap(),
+        }
+    }
+
+    fn trusted_peers(timeout: Duration) -> TrustedTestPeers {
+        let server_directory = TestDirectory::new("trusted-server");
+        let authorized_directory = TestDirectory::new("trusted-authorized");
+        let other_directory = TestDirectory::new("trusted-other");
+        let server_store = DeviceStore::new(&server_directory.0);
+        let authorized_store = DeviceStore::new(&authorized_directory.0);
+        let other_store = DeviceStore::new(&other_directory.0);
+        let server_identity = server_store.load_or_create_identity().unwrap().identity;
+        let authorized_identity = authorized_store.load_or_create_identity().unwrap().identity;
+        let other_identity = other_store.load_or_create_identity().unwrap().identity;
+        let server_certificate = server_identity.certificate_der().to_vec();
+        let server_fingerprint = server_identity.fingerprint();
+        let authorized_certificate = authorized_identity.certificate_der().to_vec();
+        let authorized_fingerprint = authorized_identity.fingerprint();
+        let other_certificate = other_identity.certificate_der().to_vec();
+        let other_fingerprint = other_identity.fingerprint();
+        server_store
+            .trust_peer(
+                authorized_certificate,
+                authorized_fingerprint,
+                "Authorized PC",
+            )
+            .unwrap();
+        server_store
+            .trust_peer(other_certificate, other_fingerprint, "Other PC")
+            .unwrap();
+        let authorized = PinnedTlsClient::new(
+            &authorized_identity,
+            server_certificate.clone(),
+            server_fingerprint,
+            timeout,
+        )
+        .unwrap();
+        let other = PinnedTlsClient::new(
+            &other_identity,
+            server_certificate,
+            server_fingerprint,
+            timeout,
+        )
+        .unwrap();
+        let server = TrustedTlsServer::new(server_identity, server_store.clone(), timeout).unwrap();
+        TrustedTestPeers {
+            _server_directory: server_directory,
+            _authorized_directory: authorized_directory,
+            _other_directory: other_directory,
+            server_store,
+            server,
+            authorized,
+            other,
+            authorized_fingerprint,
         }
     }
 
@@ -1978,6 +2255,130 @@ mod tests {
     }
 
     #[test]
+    fn trusted_but_offer_unauthorized_device_is_denied_after_mutual_tls() {
+        let peers = trusted_peers(Duration::from_secs(3));
+        let offered = SecureOfferedFile::generated(
+            Arc::from("Remote-Secure-Test.bin"),
+            4096,
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start_trusted(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server.clone(),
+            peers.authorized_fingerprint,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let authorized = SecureOfferClient::new(server.address(), peers.authorized.clone());
+        let other = SecureOfferClient::new(server.address(), peers.other.clone());
+        assert_eq!(authorized.fetch_manifest().unwrap().descriptor.size, 4096);
+        assert!(other.fetch_manifest().is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.metrics().denied_requests == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let metrics = server.metrics();
+        assert!(metrics.denied_requests >= 1);
+        assert_eq!(metrics.tls_failures, 0);
+        assert_eq!(metrics.protocol_errors, 0);
+        assert_eq!(metrics.begun_transfers, 0);
+    }
+
+    #[test]
+    fn revocation_interrupts_a_paused_read_on_existing_tls_connections() {
+        let peers = trusted_peers(Duration::from_secs(3));
+        let offered = SecureOfferedFile::generated(
+            Arc::from("Remote-Secure-Test.bin"),
+            4096,
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start_trusted(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server.clone(),
+            peers.authorized_fingerprint,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.authorized.clone());
+        let manifest = client.fetch_manifest().unwrap();
+        let source = Arc::new(SecureRemoteSource::new(client, manifest));
+        let mut first = [0_u8; 256];
+        assert_eq!(source.read_at(0, &mut first).unwrap(), first.len());
+        assert_eq!(source.pause().unwrap().state, RemoteTransferState::Paused);
+
+        let reader = Arc::clone(&source);
+        let read = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 256];
+            reader.read_at(256, &mut bytes)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.metrics().active_reads == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.metrics().active_reads, 1);
+        peers
+            .server_store
+            .revoke_peer(peers.authorized_fingerprint)
+            .unwrap();
+        assert!(read.join().unwrap().is_err());
+        assert!(source.status().is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (server.metrics().active_reads != 0 || server.metrics().cancelled_transfers == 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let metrics = server.metrics();
+        assert_eq!(metrics.active_reads, 0);
+        assert_eq!(metrics.cancelled_transfers, 1);
+        assert!(metrics.denied_requests >= 1);
+        assert_eq!(metrics.tls_failures, 0);
+        assert_eq!(metrics.protocol_errors, 0);
+    }
+
+    #[test]
+    fn revoked_peer_cannot_open_a_new_tls_connection() {
+        let peers = trusted_peers(Duration::from_secs(3));
+        let offered = SecureOfferedFile::generated(
+            Arc::from("Remote-Secure-Test.bin"),
+            4096,
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start_trusted(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server.clone(),
+            peers.authorized_fingerprint,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        peers
+            .server_store
+            .revoke_peer(peers.authorized_fingerprint)
+            .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.authorized.clone());
+        assert!(client.fetch_manifest().is_err());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.metrics().tls_failures == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let metrics = server.metrics();
+        assert!(metrics.tls_failures >= 1);
+        assert_eq!(metrics.begun_transfers, 0);
+        assert_eq!(metrics.protocol_errors, 0);
+    }
+
+    #[test]
     fn malformed_plaintext_client_never_reaches_the_protocol() {
         let (server, _client, _) = start_generated(4096);
         let mut socket = TcpStream::connect(server.address()).unwrap();
@@ -2025,5 +2426,45 @@ mod tests {
         }
         assert!(server.metrics().protocol_errors >= 1);
         assert_eq!(client.fetch_manifest().unwrap().descriptor.size, 4096);
+    }
+
+    #[test]
+    fn malformed_frame_corpus_is_bounded_and_rejected() {
+        let mut corpus = Vec::new();
+
+        for length in 1..FRAME_HEADER_LEN {
+            corpus.push(vec![0_u8; length]);
+        }
+
+        let mut invalid_magic = [0_u8; FRAME_HEADER_LEN];
+        invalid_magic[..4].copy_from_slice(b"NOPE");
+        invalid_magic[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        corpus.push(invalid_magic.to_vec());
+
+        let mut invalid_version = [0_u8; FRAME_HEADER_LEN];
+        invalid_version[..4].copy_from_slice(&MAGIC);
+        invalid_version[4..6].copy_from_slice(&PROTOCOL_VERSION.wrapping_add(1).to_be_bytes());
+        corpus.push(invalid_version.to_vec());
+
+        let mut oversized = [0_u8; FRAME_HEADER_LEN];
+        oversized[..4].copy_from_slice(&MAGIC);
+        oversized[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        oversized[16..20]
+            .copy_from_slice(&(u32::try_from(MAX_FRAME_PAYLOAD).unwrap() + 1).to_be_bytes());
+        corpus.push(oversized.to_vec());
+
+        let mut missing_payload = [0_u8; FRAME_HEADER_LEN];
+        missing_payload[..4].copy_from_slice(&MAGIC);
+        missing_payload[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        missing_payload[16..20].copy_from_slice(&16_u32.to_be_bytes());
+        corpus.push(missing_payload.to_vec());
+
+        for bytes in corpus {
+            let error = read_frame(&mut bytes.as_slice()).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ));
+        }
     }
 }

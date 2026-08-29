@@ -16,6 +16,8 @@ use rustls::{
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
+use crate::device_store::DeviceStore;
+
 const CERTIFICATE_LIMIT: usize = 64 * 1024;
 const PRIVATE_KEY_LIMIT: usize = 64 * 1024;
 const SERVER_NAME: &str = "clipferry.local";
@@ -291,8 +293,21 @@ impl PinnedTlsServer {
     /// Returns an error for socket, timeout, TLS, ALPN, or certificate verification failures.
     pub fn accept(
         &self,
-        mut socket: TcpStream,
+        socket: TcpStream,
     ) -> io::Result<StreamOwned<ServerConnection, TcpStream>> {
+        self.accept_authenticated(socket)
+            .map(|authenticated| authenticated.stream)
+    }
+
+    /// Completes pinned mutual TLS and returns the authenticated client fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for socket, timeout, TLS, ALPN, or certificate verification failures.
+    pub fn accept_authenticated(
+        &self,
+        mut socket: TcpStream,
+    ) -> io::Result<AuthenticatedServerConnection> {
         socket.set_nonblocking(false)?;
         configure_socket(&socket, self.timeout)?;
         let mut connection =
@@ -303,7 +318,123 @@ impl PinnedTlsServer {
                 .map_err(invalid_crypto)?;
         }
         verify_negotiated_connection(&connection, self.expected_peer)?;
-        Ok(StreamOwned::new(connection, socket))
+        Ok(AuthenticatedServerConnection {
+            stream: StreamOwned::new(connection, socket),
+            peer_fingerprint: self.expected_peer,
+        })
+    }
+
+    #[must_use]
+    pub fn expected_peer(&self) -> CertificateFingerprint {
+        self.expected_peer
+    }
+}
+
+pub struct AuthenticatedServerConnection {
+    pub stream: StreamOwned<ServerConnection, TcpStream>,
+    pub peer_fingerprint: CertificateFingerprint,
+}
+
+#[derive(Clone)]
+pub struct TrustedTlsServer {
+    identity: Arc<TlsIdentity>,
+    trust_store: DeviceStore,
+    timeout: Duration,
+}
+
+impl TrustedTlsServer {
+    /// Builds a TLS 1.3 server whose accepted client set is reloaded from the trust registry for
+    /// every new connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local identity does not match the identity in the supplied store.
+    pub fn new(
+        identity: TlsIdentity,
+        trust_store: DeviceStore,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        if timeout.is_zero() {
+            return Err(invalid_data("TLS timeout must be greater than zero"));
+        }
+        let stored = trust_store.load_identity()?;
+        if stored.fingerprint() != identity.fingerprint() {
+            return Err(invalid_data(
+                "TLS identity does not match the device trust store",
+            ));
+        }
+        Ok(Self {
+            identity: Arc::new(identity),
+            trust_store,
+            timeout,
+        })
+    }
+
+    /// Completes mutual TLS against the current trusted-peer set and rechecks the exact peer record
+    /// after the handshake, so a concurrent revocation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty/corrupt trust registry, socket or TLS failure, an untrusted
+    /// certificate, or revocation during the handshake.
+    pub fn accept(&self, mut socket: TcpStream) -> io::Result<AuthenticatedServerConnection> {
+        socket.set_nonblocking(false)?;
+        configure_socket(&socket, self.timeout)?;
+        let peers = self.trust_store.list_peers()?;
+        if peers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no trusted peer is authorized for mutual TLS",
+            ));
+        }
+        let mut roots = RootCertStore::empty();
+        for peer in peers {
+            roots
+                .add(CertificateDer::from(peer.into_certificate_der()))
+                .map_err(invalid_crypto)?;
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+                .build()
+                .map_err(invalid_crypto)?;
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(invalid_crypto)?
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![self.identity.certificate.clone()],
+                self.identity.private_key.clone_key(),
+            )
+            .map_err(invalid_crypto)?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        config.max_early_data_size = 0;
+        let mut connection = ServerConnection::new(Arc::new(config)).map_err(invalid_crypto)?;
+        while connection.is_handshaking() {
+            connection
+                .complete_io(&mut socket)
+                .map_err(invalid_crypto)?;
+        }
+        let peer_fingerprint = negotiated_peer_fingerprint(&connection)?;
+        let certificate = connection
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| invalid_data("peer did not provide a certificate"))?;
+        let current = self.trust_store.load_peer(peer_fingerprint)?;
+        if current.certificate_der() != certificate.as_ref() {
+            return Err(invalid_data(
+                "trusted peer certificate changed during the TLS handshake",
+            ));
+        }
+        Ok(AuthenticatedServerConnection {
+            stream: StreamOwned::new(connection, socket),
+            peer_fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub fn trust_store(&self) -> DeviceStore {
+        self.trust_store.clone()
     }
 }
 
@@ -325,6 +456,18 @@ fn verify_negotiated_connection(
     connection: &rustls::CommonState,
     expected_peer: CertificateFingerprint,
 ) -> io::Result<()> {
+    let actual = negotiated_peer_fingerprint(connection)?;
+    if actual != expected_peer {
+        return Err(invalid_data(format!(
+            "peer certificate fingerprint mismatch: expected {expected_peer}, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn negotiated_peer_fingerprint(
+    connection: &rustls::CommonState,
+) -> io::Result<CertificateFingerprint> {
     if connection.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
         return Err(invalid_data("TLS 1.3 was not negotiated"));
     }
@@ -339,7 +482,9 @@ fn verify_negotiated_connection(
             "peer certificate chain must contain exactly the pinned certificate",
         ));
     }
-    verify_peer_pin(certificates[0].as_ref(), expected_peer)
+    Ok(CertificateFingerprint::from_certificate(
+        certificates[0].as_ref(),
+    ))
 }
 
 fn verify_peer_pin(certificate: &[u8], expected: CertificateFingerprint) -> io::Result<()> {

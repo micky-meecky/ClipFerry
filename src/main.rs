@@ -6,15 +6,15 @@ use std::time::Duration;
 use clipferry::clipboard::secure_transfer::SecureOfferClient;
 use clipferry::clipboard::{
     ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
-    SecureFetchProbeOptions, SecureReceiverProbeOptions, SecureSourceProbeOptions,
+    SecureFetchProbeOptions, SecureReceiverProbeOptions, SecureSourceProbeOptions, SecureSourceTls,
     run_clipboard_probe, run_file_capture_probe, run_loopback_probe, run_pause_probe,
     run_secure_fetch_probe, run_secure_receiver_probe, run_secure_source_probe,
 };
 use clipferry::device_store::DeviceStore;
 use clipferry::pairing::{PendingPairing, connect_for_pairing, listen_for_pairing};
 use clipferry::security::{
-    CertificateFingerprint, PinnedTlsClient, PinnedTlsServer, TlsIdentity, generate_test_identity,
-    load_and_verify_peer_certificate,
+    CertificateFingerprint, PinnedTlsClient, PinnedTlsServer, TlsIdentity, TrustedTlsServer,
+    generate_test_identity, load_and_verify_peer_certificate,
 };
 
 fn main() -> ExitCode {
@@ -162,18 +162,11 @@ fn run() -> Result<(), String> {
         }
         "secure-source-test" => {
             let parsed = parse_secure_source_options(arguments)?;
-            let (identity, peer_certificate, peer_fingerprint) = parsed.tls.load()?;
+            let (tls, local_fingerprint, peer_fingerprint) =
+                parsed.tls.load_source(parsed.io_timeout)?;
             println!(
-                "IDENTITY local_fingerprint={} pinned_peer={peer_fingerprint}",
-                identity.fingerprint()
+                "IDENTITY local_fingerprint={local_fingerprint} pinned_peer={peer_fingerprint}"
             );
-            let tls = PinnedTlsServer::new(
-                &identity,
-                peer_certificate,
-                peer_fingerprint,
-                parsed.io_timeout,
-            )
-            .map_err(|error| format!("TLS server configuration failed: {error}"))?;
             run_secure_source_probe(SecureSourceProbeOptions {
                 listen_address: parsed.listen_address,
                 source_path: parsed.source_path,
@@ -316,6 +309,60 @@ impl TlsCliFiles {
             load_and_verify_peer_certificate(&peer_certificate_path, peer_fingerprint)
                 .map_err(|error| format!("peer pin verification failed: {error}"))?;
         Ok((identity, peer_certificate, peer_fingerprint))
+    }
+
+    fn load_source(
+        self,
+        timeout: Duration,
+    ) -> Result<
+        (
+            SecureSourceTls,
+            CertificateFingerprint,
+            CertificateFingerprint,
+        ),
+        String,
+    > {
+        if let Some(root) = self.store {
+            if self.identity_certificate.is_some()
+                || self.identity_private_key.is_some()
+                || self.peer_certificate.is_some()
+            {
+                return Err(
+                    "--store cannot be combined with --identity-cert, --identity-key, or --peer-cert"
+                        .to_owned(),
+                );
+            }
+            let peer_fingerprint = self
+                .peer_fingerprint
+                .ok_or_else(|| "--peer-fingerprint is required".to_owned())?;
+            let store = DeviceStore::new(root);
+            let identity = store
+                .load_identity()
+                .map_err(|error| format!("device identity load failed: {error}"))?;
+            store
+                .load_peer(peer_fingerprint)
+                .map_err(|error| format!("trusted peer load failed: {error}"))?;
+            let local_fingerprint = identity.fingerprint();
+            let tls = TrustedTlsServer::new(identity, store, timeout)
+                .map_err(|error| format!("TLS server configuration failed: {error}"))?;
+            return Ok((
+                SecureSourceTls::Trusted {
+                    tls,
+                    authorized_peer: peer_fingerprint,
+                },
+                local_fingerprint,
+                peer_fingerprint,
+            ));
+        }
+        let (identity, peer_certificate, peer_fingerprint) = self.load()?;
+        let local_fingerprint = identity.fingerprint();
+        let tls = PinnedTlsServer::new(&identity, peer_certificate, peer_fingerprint, timeout)
+            .map_err(|error| format!("TLS server configuration failed: {error}"))?;
+        Ok((
+            SecureSourceTls::Pinned(tls),
+            local_fingerprint,
+            peer_fingerprint,
+        ))
     }
 }
 

@@ -45,7 +45,7 @@ use super::secure_transfer::{
 use super::source::{MemorySource, ReadAtSource};
 use super::transfer::{GeneratedSource, TransferControl};
 use super::{TEST_FILE_CONTENT, TEST_FILE_NAME};
-use crate::security::PinnedTlsServer;
+use crate::security::{CertificateFingerprint, PinnedTlsServer, TrustedTlsServer};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClipboardProbeOptions {
@@ -87,7 +87,15 @@ pub struct SecureSourceProbeOptions {
     pub transfer_ttl: Duration,
     pub io_timeout: Duration,
     pub lifetime: Option<Duration>,
-    pub tls: PinnedTlsServer,
+    pub tls: SecureSourceTls,
+}
+
+pub enum SecureSourceTls {
+    Pinned(PinnedTlsServer),
+    Trusted {
+        tls: TrustedTlsServer,
+        authorized_peer: CertificateFingerprint,
+    },
 }
 
 pub struct SecureReceiverProbeOptions {
@@ -778,13 +786,26 @@ pub fn run_secure_source_probe(options: SecureSourceProbeOptions) -> std::io::Re
         .publish(snapshot, options.offer_ttl)
         .map_err(windows_to_io)?;
     let offered = SecureOfferedFile::from_local_offer(&local_offer)?;
-    let mut server = SecureOfferServer::start(
-        options.listen_address,
-        options.tls,
-        offered,
-        options.transfer_ttl,
-        options.io_timeout,
-    )?;
+    let mut server = match options.tls {
+        SecureSourceTls::Pinned(tls) => SecureOfferServer::start(
+            options.listen_address,
+            tls,
+            offered,
+            options.transfer_ttl,
+            options.io_timeout,
+        )?,
+        SecureSourceTls::Trusted {
+            tls,
+            authorized_peer,
+        } => SecureOfferServer::start_trusted(
+            options.listen_address,
+            tls,
+            authorized_peer,
+            offered,
+            options.transfer_ttl,
+            options.io_timeout,
+        )?,
+    };
     let manifest = server.manifest();
     println!(
         "READY mode=secure-source tls=1.3 mtls=true address={} offer={} file_id={} file={} size={} content_reads=0 lifetime={}",
