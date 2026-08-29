@@ -91,6 +91,7 @@ dependencies = [
  "sha2",
  "windows",
  "windows-core",
+ "zeroize",
 ]
 
 [[package]]

@@ -10,6 +10,8 @@ use clipferry::clipboard::{
     run_clipboard_probe, run_file_capture_probe, run_loopback_probe, run_pause_probe,
     run_secure_fetch_probe, run_secure_receiver_probe, run_secure_source_probe,
 };
+use clipferry::device_store::DeviceStore;
+use clipferry::pairing::{PendingPairing, connect_for_pairing, listen_for_pairing};
 use clipferry::security::{
     CertificateFingerprint, PinnedTlsClient, PinnedTlsServer, TlsIdentity, generate_test_identity,
     load_and_verify_peer_certificate,
@@ -65,6 +67,87 @@ fn run() -> Result<(), String> {
             let options = parse_file_capture_probe_options(arguments)?;
             run_file_capture_probe(options)
                 .map_err(|error| format!("{error} ({:#010X})", error.code().0.cast_unsigned()))
+        }
+        "pair-listen" => {
+            let options = parse_pairing_options(arguments, "--listen")?;
+            let pending = listen_for_pairing(options.store, options.address, options.timeout)
+                .map_err(|error| format!("pairing listener failed: {error}"))?;
+            confirm_pairing(pending, &options.label)
+        }
+        "pair-connect" => {
+            let options = parse_pairing_options(arguments, "--connect")?;
+            let pending = connect_for_pairing(options.store, options.address, options.timeout)
+                .map_err(|error| format!("pairing connection failed: {error}"))?;
+            confirm_pairing(pending, &options.label)
+        }
+        "device-init" => {
+            let store = parse_store_only(arguments)?;
+            let stored = store
+                .load_or_create_identity()
+                .map_err(|error| format!("device identity initialization failed: {error}"))?;
+            println!(
+                "DEVICE created={} fingerprint={} store={}",
+                stored.created,
+                stored.identity.fingerprint(),
+                store.root().display()
+            );
+            Ok(())
+        }
+        "device-show" => {
+            let store = parse_store_only(arguments)?;
+            let identity = store
+                .load_identity()
+                .map_err(|error| format!("device identity load failed: {error}"))?;
+            println!(
+                "DEVICE fingerprint={} store={}",
+                identity.fingerprint(),
+                store.root().display()
+            );
+            Ok(())
+        }
+        "device-export-cert" => {
+            let (store, output) = parse_store_and_output(arguments)?;
+            let fingerprint = store
+                .export_certificate(&output)
+                .map_err(|error| format!("certificate export failed: {error}"))?;
+            println!(
+                "CERTIFICATE exported=true fingerprint={fingerprint} path={}",
+                output.display()
+            );
+            Ok(())
+        }
+        "trust-import" => {
+            let (store, certificate, fingerprint, label) = parse_trust_import(arguments)?;
+            let peer = store
+                .trust_peer_file(&certificate, fingerprint, &label)
+                .map_err(|error| format!("trust import failed: {error}"))?;
+            println!(
+                "TRUST imported=true fingerprint={} label={:?}",
+                peer.fingerprint, peer.label
+            );
+            Ok(())
+        }
+        "trust-list" => {
+            let store = parse_store_only(arguments)?;
+            let peers = store
+                .list_peers()
+                .map_err(|error| format!("trust list failed: {error}"))?;
+            println!("TRUST peers={}", peers.len());
+            for peer in peers {
+                println!(
+                    "PEER fingerprint={} label={:?}",
+                    peer.fingerprint, peer.label
+                );
+            }
+            Ok(())
+        }
+        "trust-revoke" => {
+            let (store, fingerprint) = parse_store_and_fingerprint(arguments)?;
+            store
+                .revoke_peer(fingerprint)
+                .map_err(|error| format!("trust revocation failed: {error}"))?;
+            println!("TRUST revoked=true fingerprint={fingerprint}");
+            Ok(())
         }
         "identity-test-generate" => {
             let (certificate, private_key) = parse_identity_generation_options(arguments)?;
@@ -152,6 +235,20 @@ fn print_usage() {
         "  clipferry file-capture-test [--offer-ttl-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
     );
     println!(
+        "  clipferry pair-listen --listen <private-ip:port> --label <peer-name> [--store <directory>] [--timeout-seconds <1..300>]"
+    );
+    println!(
+        "  clipferry pair-connect --connect <private-ip:port> --label <peer-name> [--store <directory>] [--timeout-seconds <1..300>]"
+    );
+    println!("  clipferry device-init [--store <directory>]");
+    println!("  clipferry device-show [--store <directory>]");
+    println!("  clipferry device-export-cert --out <certificate.der> [--store <directory>]");
+    println!(
+        "  clipferry trust-import --cert <certificate.der> --fingerprint <SHA-256> --label <name> [--store <directory>]"
+    );
+    println!("  clipferry trust-list [--store <directory>]");
+    println!("  clipferry trust-revoke --fingerprint <SHA-256> [--store <directory>]");
+    println!(
         "  clipferry identity-test-generate --cert-out <certificate.der> --key-out <private-key.der>"
     );
     println!(
@@ -163,10 +260,14 @@ fn print_usage() {
     println!(
         "  clipferry secure-receiver-test --connect <private-ip:port> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>] [--async-mode] [--lifetime-seconds <seconds>]"
     );
+    println!(
+        "  For secure-*-test, --store <directory> --peer-fingerprint <SHA-256> replaces the three DER path options"
+    );
 }
 
 #[derive(Default)]
 struct TlsCliFiles {
+    store: Option<std::path::PathBuf>,
     identity_certificate: Option<std::path::PathBuf>,
     identity_private_key: Option<std::path::PathBuf>,
     peer_certificate: Option<std::path::PathBuf>,
@@ -175,6 +276,28 @@ struct TlsCliFiles {
 
 impl TlsCliFiles {
     fn load(self) -> Result<(TlsIdentity, Vec<u8>, CertificateFingerprint), String> {
+        if let Some(root) = self.store {
+            if self.identity_certificate.is_some()
+                || self.identity_private_key.is_some()
+                || self.peer_certificate.is_some()
+            {
+                return Err(
+                    "--store cannot be combined with --identity-cert, --identity-key, or --peer-cert"
+                        .to_owned(),
+                );
+            }
+            let peer_fingerprint = self
+                .peer_fingerprint
+                .ok_or_else(|| "--peer-fingerprint is required".to_owned())?;
+            let store = DeviceStore::new(root);
+            let identity = store
+                .load_identity()
+                .map_err(|error| format!("device identity load failed: {error}"))?;
+            let peer = store
+                .load_peer(peer_fingerprint)
+                .map_err(|error| format!("trusted peer load failed: {error}"))?;
+            return Ok((identity, peer.into_certificate_der(), peer_fingerprint));
+        }
         let identity_certificate = self
             .identity_certificate
             .ok_or_else(|| "--identity-cert is required".to_owned())?;
@@ -196,6 +319,105 @@ impl TlsCliFiles {
     }
 }
 
+fn parse_store_only(mut arguments: impl Iterator<Item = String>) -> Result<DeviceStore, String> {
+    let mut root = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--store" => root = Some(parse_path(&mut arguments, &argument)?),
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    resolve_store(root)
+}
+
+fn parse_store_and_output(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(DeviceStore, std::path::PathBuf), String> {
+    let mut root = None;
+    let mut output = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--store" => root = Some(parse_path(&mut arguments, &argument)?),
+            "--out" => output = Some(parse_path(&mut arguments, &argument)?),
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok((
+        resolve_store(root)?,
+        output.ok_or_else(|| "--out is required".to_owned())?,
+    ))
+}
+
+fn parse_trust_import(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<
+    (
+        DeviceStore,
+        std::path::PathBuf,
+        CertificateFingerprint,
+        String,
+    ),
+    String,
+> {
+    let mut root = None;
+    let mut certificate = None;
+    let mut fingerprint = None;
+    let mut label = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--store" => root = Some(parse_path(&mut arguments, &argument)?),
+            "--cert" => certificate = Some(parse_path(&mut arguments, &argument)?),
+            "--fingerprint" => {
+                fingerprint = Some(parse_fingerprint(&mut arguments, &argument)?);
+            }
+            "--label" => {
+                label = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--label requires a value".to_owned())?,
+                );
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok((
+        resolve_store(root)?,
+        certificate.ok_or_else(|| "--cert is required".to_owned())?,
+        fingerprint.ok_or_else(|| "--fingerprint is required".to_owned())?,
+        label.ok_or_else(|| "--label is required".to_owned())?,
+    ))
+}
+
+fn parse_store_and_fingerprint(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(DeviceStore, CertificateFingerprint), String> {
+    let mut root = None;
+    let mut fingerprint = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--store" => root = Some(parse_path(&mut arguments, &argument)?),
+            "--fingerprint" => {
+                fingerprint = Some(parse_fingerprint(&mut arguments, &argument)?);
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok((
+        resolve_store(root)?,
+        fingerprint.ok_or_else(|| "--fingerprint is required".to_owned())?,
+    ))
+}
+
+fn resolve_store(root: Option<std::path::PathBuf>) -> Result<DeviceStore, String> {
+    root.map_or_else(
+        || {
+            DeviceStore::current_user()
+                .map_err(|error| format!("device store unavailable: {error}"))
+        },
+        |root| Ok(DeviceStore::new(root)),
+    )
+}
+
 struct ParsedSecureSource {
     listen_address: std::net::SocketAddr,
     source_path: std::path::PathBuf,
@@ -213,6 +435,85 @@ struct ParsedSecureClient {
     lifetime: Option<Duration>,
     async_mode: bool,
     tls: TlsCliFiles,
+}
+
+struct PairingCliOptions {
+    address: std::net::SocketAddr,
+    store: DeviceStore,
+    label: String,
+    timeout: Duration,
+}
+
+fn parse_pairing_options(
+    mut arguments: impl Iterator<Item = String>,
+    endpoint_option: &str,
+) -> Result<PairingCliOptions, String> {
+    let mut address = None;
+    let mut root = None;
+    let mut label = None;
+    let mut timeout_seconds = 120_u64;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            value if value == endpoint_option => {
+                address = Some(parse_private_socket(&mut arguments, &argument)?);
+            }
+            "--store" => root = Some(parse_path(&mut arguments, &argument)?),
+            "--label" => {
+                label = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--label requires a value".to_owned())?,
+                );
+            }
+            "--timeout-seconds" => {
+                timeout_seconds = parse_value(&mut arguments, &argument)?;
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    if !(1..=300).contains(&timeout_seconds) {
+        return Err("--timeout-seconds must be between 1 and 300".to_owned());
+    }
+    let label = label.ok_or_else(|| "--label is required".to_owned())?;
+    let trimmed_label = label.trim();
+    if trimmed_label.is_empty()
+        || trimmed_label.len() > 128
+        || trimmed_label.chars().any(char::is_control)
+    {
+        return Err(
+            "--label must contain 1 to 128 UTF-8 bytes without control characters".to_owned(),
+        );
+    }
+    Ok(PairingCliOptions {
+        address: address.ok_or_else(|| format!("{endpoint_option} is required"))?,
+        store: resolve_store(root)?,
+        label: trimmed_label.to_owned(),
+        timeout: Duration::from_secs(timeout_seconds),
+    })
+}
+
+fn confirm_pairing(pending: PendingPairing, label: &str) -> Result<(), String> {
+    println!(
+        "PAIR verify_code={} local_fingerprint={} peer_fingerprint={} peer_address={}",
+        pending.code(),
+        pending.local_fingerprint(),
+        pending.peer_fingerprint(),
+        pending.peer_address()
+    );
+    println!("Compare verify_code on both devices. Type YES on both devices to approve:");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("pairing confirmation input failed: {error}"))?;
+    let approved = answer.trim() == "YES";
+    let peer = pending
+        .confirm(approved, label)
+        .map_err(|error| format!("pairing confirmation failed: {error}"))?;
+    println!(
+        "PAIRED completed=true fingerprint={} label={:?}",
+        peer.fingerprint, peer.label
+    );
+    Ok(())
 }
 
 fn parse_identity_generation_options(
@@ -260,6 +561,9 @@ fn parse_secure_source_options(
             }
             "--lifetime-seconds" => {
                 lifetime = Some(Duration::from_secs(parse_value(&mut arguments, &argument)?));
+            }
+            "--store" => {
+                tls.store = Some(parse_path(&mut arguments, &argument)?);
             }
             "--identity-cert" => {
                 tls.identity_certificate = Some(parse_path(&mut arguments, &argument)?);
@@ -315,6 +619,9 @@ fn parse_secure_client_options(
                 lifetime = Some(Duration::from_secs(parse_value(&mut arguments, &argument)?));
             }
             "--async-mode" if !allow_output => async_mode = true,
+            "--store" => {
+                tls.store = Some(parse_path(&mut arguments, &argument)?);
+            }
             "--identity-cert" => {
                 tls.identity_certificate = Some(parse_path(&mut arguments, &argument)?);
             }
@@ -348,6 +655,7 @@ fn parse_secure_client_options(
 
 fn build_secure_client(parsed: &ParsedSecureClient) -> Result<SecureOfferClient, String> {
     let tls_files = TlsCliFiles {
+        store: parsed.tls.store.clone(),
         identity_certificate: parsed.tls.identity_certificate.clone(),
         identity_private_key: parsed.tls.identity_private_key.clone(),
         peer_certificate: parsed.tls.peer_certificate.clone(),

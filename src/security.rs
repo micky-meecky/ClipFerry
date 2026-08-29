@@ -14,6 +14,7 @@ use rustls::{
     StreamOwned,
 };
 use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
 
 const CERTIFICATE_LIMIT: usize = 64 * 1024;
 const PRIVATE_KEY_LIMIT: usize = 64 * 1024;
@@ -88,7 +89,7 @@ impl TlsIdentity {
         Self::from_der(certificate, private_key)
     }
 
-    fn from_der(certificate: Vec<u8>, private_key: Vec<u8>) -> io::Result<Self> {
+    pub(crate) fn from_der(certificate: Vec<u8>, private_key: Vec<u8>) -> io::Result<Self> {
         if certificate.is_empty() || private_key.is_empty() {
             return Err(invalid_data(
                 "certificate and private key must not be empty",
@@ -105,6 +106,11 @@ impl TlsIdentity {
     #[must_use]
     pub fn fingerprint(&self) -> CertificateFingerprint {
         self.fingerprint
+    }
+
+    #[must_use]
+    pub fn certificate_der(&self) -> &[u8] {
+        self.certificate.as_ref()
     }
 
     #[cfg(test)]
@@ -130,17 +136,21 @@ pub fn generate_test_identity(
     certificate_path: &Path,
     private_key_path: &Path,
 ) -> io::Result<CertificateFingerprint> {
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed([SERVER_NAME.to_owned()]).map_err(invalid_crypto)?;
-    let certificate = cert.der().as_ref();
-    let private_key = signing_key.serialize_der();
+    let (certificate, private_key) = generate_identity_der()?;
+    let private_key = Zeroizing::new(private_key);
 
     write_new_secret(private_key_path, &private_key)?;
-    if let Err(error) = write_new_public(certificate_path, certificate) {
+    if let Err(error) = write_new_public(certificate_path, &certificate) {
         let _ = fs::remove_file(private_key_path);
         return Err(error);
     }
-    Ok(CertificateFingerprint::from_certificate(certificate))
+    Ok(CertificateFingerprint::from_certificate(&certificate))
+}
+
+pub(crate) fn generate_identity_der() -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed([SERVER_NAME.to_owned()]).map_err(invalid_crypto)?;
+    Ok((cert.der().as_ref().to_vec(), signing_key.serialize_der()))
 }
 
 #[derive(Clone)]
@@ -195,7 +205,22 @@ impl PinnedTlsClient {
         &self,
         address: SocketAddr,
     ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
-        let mut socket = TcpStream::connect_timeout(&address, self.timeout)?;
+        let socket = TcpStream::connect_timeout(&address, self.timeout)?;
+        self.connect_socket(socket)
+    }
+
+    /// Completes pinned mutual TLS on an already-connected socket.
+    ///
+    /// This is used to upgrade the bounded first-pairing exchange and prove possession of the
+    /// private keys corresponding to both certificates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for socket, timeout, TLS, ALPN, or certificate verification failures.
+    pub fn connect_socket(
+        &self,
+        mut socket: TcpStream,
+    ) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
         configure_socket(&socket, self.timeout)?;
         let server_name = ServerName::try_from(SERVER_NAME)
             .map_err(invalid_crypto)?
