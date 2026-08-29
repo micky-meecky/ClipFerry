@@ -1,7 +1,8 @@
 ﻿[CmdletBinding()]
 param(
     [string]$ExecutablePath,
-    [string]$DataRoot = (Join-Path $env:LOCALAPPDATA 'ClipFerry\Stage5Test'),
+    [string]$DataRoot,
+    [switch]$Stage6,
     [switch]$SelfTest
 )
 
@@ -14,12 +15,22 @@ Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
     $ExecutablePath = Join-Path $PSScriptRoot 'clipferry.exe'
 }
+if ([string]::IsNullOrWhiteSpace($DataRoot)) {
+    $stageDirectory = if ($Stage6) { 'Stage6Test' } else { 'Stage5Test' }
+    $DataRoot = Join-Path $env:LOCALAPPDATA "ClipFerry\$stageDirectory"
+}
 
-$script:ExpectedExecutableSha256 = '73457F5108CBC4843F1C4563ADB42FF1EF9CAB6A1075B12F2A942F0998DC059B'
-$script:ConfigPath = Join-Path $DataRoot 'stage5-menu.json'
+$script:ExpectedExecutableSha256 = 'CF0A9E709917F5B59A966F2E0A0EAD0A4690B3532C0D076909B3D8B3EBDC94B6'
+$script:ConfigPath = Join-Path $DataRoot $(if ($Stage6) { 'stage6-menu.json' } else { 'stage5-menu.json' })
 $script:SourceRoot = Join-Path $DataRoot 'source'
 $script:ReceiveRoot = Join-Path $DataRoot 'receive'
-$script:DefaultSource = Join-Path $script:SourceRoot 'ClipFerry-Stage5-Test.txt'
+$script:Stage6TreeName = 'ClipFerry-Stage6-Tree'
+$script:DefaultSource = if ($Stage6) {
+    Join-Path $script:SourceRoot $script:Stage6TreeName
+}
+else {
+    Join-Path $script:SourceRoot 'ClipFerry-Stage5-Test.txt'
+}
 
 try {
     [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -61,6 +72,7 @@ function New-DefaultConfig {
         PeerAddress = ''
         Port = '45232'
         LastSourceFile = $script:DefaultSource
+        LastReceiveTree = (Join-Path $script:ReceiveRoot $script:Stage6TreeName)
         LastPeerFingerprint = ''
     }
 }
@@ -123,11 +135,114 @@ function Invoke-ClipFerry {
     }
 }
 
+function Write-DeterministicFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][int]$SizeMiB,
+        [Parameter(Mandatory = $true)][int]$Seed
+    )
+
+    $expectedLength = [int64]$SizeMiB * 1MB
+    if ([System.IO.File]::Exists($FilePath) -and
+        (Get-Item -LiteralPath $FilePath).Length -eq $expectedLength) {
+        return
+    }
+    $buffer = [byte[]]::new(1MB)
+    $random = [System.Random]::new($Seed)
+    $random.NextBytes($buffer)
+    $stream = [System.IO.File]::Open(
+        $FilePath,
+        [System.IO.FileMode]::Create,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        for ($index = 0; $index -lt $SizeMiB; $index++) {
+            $stream.Write($buffer, 0, $buffer.Length)
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Initialize-Stage6Tree {
+    if (-not $Stage6) {
+        return
+    }
+    $unicodeDirectory = Join-Path $script:DefaultSource '资料-🚢'
+    $nestedDirectory = Join-Path $unicodeDirectory '子目录'
+    $emptyDirectory = Join-Path $script:DefaultSource '空目录'
+    [System.IO.Directory]::CreateDirectory($nestedDirectory) | Out-Null
+    [System.IO.Directory]::CreateDirectory($emptyDirectory) | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $script:DefaultSource '根目录-说明.txt'),
+        "ClipFerry Stage 6 deterministic tree.`r`nUnicode: 你好，剪贴摆渡 🚢`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllBytes((Join-Path $nestedDirectory '0-byte.bin'), [byte[]]::new(0))
+    [System.IO.File]::WriteAllText(
+        (Join-Path $nestedDirectory 'Unicode-你好-🚢.txt'),
+        "alpha`r`nbeta`r`ngamma`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Write-DeterministicFile -FilePath (Join-Path $unicodeDirectory 'alpha-32-MiB.bin') -SizeMiB 32 -Seed 6001
+    Write-DeterministicFile -FilePath (Join-Path $nestedDirectory 'beta-32-MiB.bin') -SizeMiB 32 -Seed 6002
+}
+
+function Get-TreeManifest {
+    param([Parameter(Mandatory = $true)][string]$RootPath)
+
+    $root = (Resolve-Path -LiteralPath $RootPath).ProviderPath.TrimEnd('\')
+    return @(Get-ChildItem -LiteralPath $root -Force -Recurse |
+        ForEach-Object {
+            $relative = $_.FullName.Substring($root.Length).TrimStart('\')
+            if ($_.PSIsContainer) {
+                "D|$relative"
+            }
+            else {
+                $hash = Get-Sha256Hex -FilePath $_.FullName
+                "F|$relative|$($_.Length)|$hash"
+            }
+        } |
+        Sort-Object)
+}
+
+function Show-Stage6SourceManifest {
+    Initialize-Stage6Tree
+    Write-Host ''
+    Write-Host "固定测试树：$script:DefaultSource" -ForegroundColor Cyan
+    Get-TreeManifest -RootPath $script:DefaultSource | ForEach-Object { Write-Host $_ }
+}
+
+function Test-Stage6ReceivedTree {
+    if (-not $Stage6) {
+        throw '该功能仅用于阶段 6。'
+    }
+    Initialize-Stage6Tree
+    $config = Get-TestConfig
+    $target = Read-Value -Prompt '粘贴后生成的完整根目录路径' -DefaultValue $config.LastReceiveTree
+    $target = (Resolve-Path -LiteralPath $target).ProviderPath
+    $config.LastReceiveTree = $target
+    Save-TestConfig -Config $config
+    $expected = @(Get-TreeManifest -RootPath $script:DefaultSource)
+    $actual = @(Get-TreeManifest -RootPath $target)
+    $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+    if ($difference.Count -ne 0) {
+        $difference | Format-Table -AutoSize | Out-Host
+        throw '目录树不一致；上表 <= 仅源端应有，=> 仅接收端应有。'
+    }
+    Write-Host "TREE_VERIFY passed=true entries=$($expected.Count) root=$target" -ForegroundColor Green
+}
+
 function Initialize-Device {
     [System.IO.Directory]::CreateDirectory($DataRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($script:SourceRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($script:ReceiveRoot) | Out-Null
-    if (-not [System.IO.File]::Exists($script:DefaultSource)) {
+    if ($Stage6) {
+        Initialize-Stage6Tree
+    }
+    elseif (-not [System.IO.File]::Exists($script:DefaultSource)) {
         $content = "ClipFerry Stage 5 dual-PC pairing test.`r`nCreated: $([DateTime]::UtcNow.ToString('O'))`r`n"
         [System.IO.File]::WriteAllText($script:DefaultSource, $content, [System.Text.UTF8Encoding]::new($false))
     }
@@ -287,7 +402,7 @@ function Start-SecureSource {
     $sourcePath = Read-Value -Prompt '源文件路径' -DefaultValue $config.LastSourceFile
     $sourcePath = (Resolve-Path -LiteralPath $sourcePath).ProviderPath
     $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-    if ($sourceItem.PSIsContainer) {
+    if ($sourceItem.PSIsContainer -and -not $Stage6) {
         throw '阶段 5 当前仍只验收单文件。'
     }
     $config.ListenIp = $ip
@@ -296,6 +411,11 @@ function Start-SecureSource {
     Save-TestConfig -Config $config
 
     Write-Host ''
+    if ($Stage6) {
+        Write-Host '源端将只发布目录清单；看到 READY 前不应读取文件内容。' -ForegroundColor Yellow
+        Get-TreeManifest -RootPath $sourcePath | ForEach-Object { Write-Host $_ }
+        Write-Host ''
+    }
     Write-Host '源端启动后保持本窗口运行，可输入 status 或 quit。' -ForegroundColor Yellow
     Invoke-ClipFerry -Arguments @(
         'secure-source-test', '--listen', "$ip`:$port", '--file', $sourcePath,
@@ -318,6 +438,9 @@ function Read-PeerAddress {
 }
 
 function Start-SecureFetch {
+    if ($Stage6) {
+        throw '阶段 6 的目录树请使用 [B] Explorer 原生粘贴，再用 [V] 逐项核对。'
+    }
     Initialize-Device
     $fingerprint = Select-TrustedPeer
     $config = Get-TestConfig
@@ -362,10 +485,20 @@ function Show-Diagnostics {
 
 function Show-Menu {
     Clear-Host
-    Write-Host '# ClipFerry 阶段 5：持久配对与动态撤销验收' -ForegroundColor Cyan
+    if ($Stage6) {
+        Write-Host '# ClipFerry 阶段 6：多文件与文件夹验收' -ForegroundColor Cyan
+    }
+    else {
+        Write-Host '# ClipFerry 阶段 5：持久配对与动态撤销验收' -ForegroundColor Cyan
+    }
     Write-Host ''
     Write-Host '首次配对：两端 1 -> 主机 2 -> 从机 3 -> 核对同一 verify_code -> 两端输入 YES'
-    Write-Host '传输复核：主机 A -> 从机 F（基线）或 B（Explorer Ctrl+V）'
+    if ($Stage6) {
+        Write-Host '目录树复核：主机 A -> 从机 B -> Explorer Ctrl+V -> 从机 V'
+    }
+    else {
+        Write-Host '传输复核：主机 A -> 从机 F（基线）或 B（Explorer Ctrl+V）'
+    }
     Write-Host ''
     Write-Host '[1] 初始化或显示本机持久身份'
     Write-Host '[2] 监听首次配对（主机先选）'
@@ -373,8 +506,14 @@ function Show-Menu {
     Write-Host '[4] 显示已配对设备'
     Write-Host '[5] 撤销一个已配对设备'
     Write-Host '[A] 启动安全源端'
-    Write-Host '[F] Fetch 基线下载'
     Write-Host '[B] 启动 Explorer 接收端'
+    if ($Stage6) {
+        Write-Host '[C] 显示固定测试树及哈希'
+        Write-Host '[V] 核对粘贴后的完整目录树'
+    }
+    else {
+        Write-Host '[F] Fetch 基线下载'
+    }
     Write-Host '[D] 显示诊断'
     Write-Host '[O] 打开测试数据目录'
     Write-Host '[0] 退出'
@@ -401,6 +540,8 @@ while ($true) {
             'A' { Start-SecureSource; Wait-ForMenu }
             'F' { Start-SecureFetch; Wait-ForMenu }
             'B' { Start-SecureReceiver; Wait-ForMenu }
+            'C' { Show-Stage6SourceManifest; Wait-ForMenu }
+            'V' { Test-Stage6ReceivedTree; Wait-ForMenu }
             'D' { Show-Diagnostics; Wait-ForMenu }
             'O' { Start-Process explorer.exe -ArgumentList @($DataRoot) }
             '0' { exit 0 }

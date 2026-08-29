@@ -1,6 +1,7 @@
 #![allow(clippy::inline_always, clippy::ref_as_ptr)]
 
-use std::mem::{ManuallyDrop, size_of};
+use std::collections::HashMap;
+use std::mem::{ManuallyDrop, offset_of, size_of};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,13 +58,29 @@ impl ClipboardFormats {
         })
     }
 
-    fn enumerated(self) -> [FORMATETC; 4] {
-        [
-            format_etc(self.descriptor, -1, TYMED_HGLOBAL.0.cast_unsigned()),
-            format_etc(self.contents, 0, TYMED_ISTREAM.0.cast_unsigned()),
-            format_etc(self.preferred_effect, -1, TYMED_HGLOBAL.0.cast_unsigned()),
-            format_etc(self.origin, -1, TYMED_HGLOBAL.0.cast_unsigned()),
-        ]
+    fn enumerated(self, first_content_index: Option<i32>) -> Vec<FORMATETC> {
+        let mut formats = Vec::with_capacity(4);
+        formats.push(format_etc(
+            self.descriptor,
+            -1,
+            TYMED_HGLOBAL.0.cast_unsigned(),
+        ));
+        if let Some(index) = first_content_index {
+            // Microsoft documents that EnumFormatEtc should expose only one FILECONTENTS
+            // entry. Consumers select every other item by changing FORMATETC.lIndex.
+            formats.push(format_etc(
+                self.contents,
+                index,
+                TYMED_ISTREAM.0.cast_unsigned(),
+            ));
+        }
+        formats.push(format_etc(
+            self.preferred_effect,
+            -1,
+            TYMED_HGLOBAL.0.cast_unsigned(),
+        ));
+        formats.push(format_etc(self.origin, -1, TYMED_HGLOBAL.0.cast_unsigned()));
+        formats
     }
 
     fn is_feedback(self, format: u16) -> bool {
@@ -94,12 +111,39 @@ fn format_etc(format: u16, index: i32, medium: u32) -> FORMATETC {
 #[implement(IDataObject, IDataObjectAsyncCapability)]
 pub struct VirtualFileDataObject {
     formats: ClipboardFormats,
-    descriptor: VirtualFileDescriptor,
+    entries: Arc<[VirtualFileEntry]>,
     origin_payload: Arc<[u8]>,
-    source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>,
     probe: Arc<ProbeState>,
     async_mode: AtomicBool,
     in_operation: AtomicBool,
+}
+
+pub const MAX_VIRTUAL_ITEMS: usize = 4_096;
+pub const MAX_VIRTUAL_DEPTH: usize = 64;
+pub const MAX_TOTAL_VIRTUAL_PATH_U16: usize = 256 * 1024;
+
+pub(crate) type SourceFactory = Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct VirtualFileEntry {
+    pub descriptor: VirtualFileDescriptor,
+    pub source_factory: Option<SourceFactory>,
+}
+
+impl VirtualFileEntry {
+    pub(crate) fn file(descriptor: VirtualFileDescriptor, source_factory: SourceFactory) -> Self {
+        Self {
+            descriptor,
+            source_factory: Some(source_factory),
+        }
+    }
+
+    pub(crate) fn directory(descriptor: VirtualFileDescriptor) -> Self {
+        Self {
+            descriptor,
+            source_factory: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +167,11 @@ impl VirtualFileDescriptor {
             last_access_time: None,
             last_write_time: None,
         }
+    }
+
+    #[must_use]
+    pub fn is_directory(&self) -> bool {
+        self.attributes & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0 != 0
     }
 }
 
@@ -152,14 +201,25 @@ impl VirtualFileDataObject {
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
         }
-        let source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync> =
-            Arc::new(move || Arc::clone(&source));
+        let source_factory: SourceFactory = Arc::new(move || Arc::clone(&source));
         Self::create_with_source_factory(descriptor, source_factory, probe, origin_payload)
     }
 
     pub(crate) fn create_with_source_factory(
         descriptor: VirtualFileDescriptor,
-        source_factory: Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>,
+        source_factory: SourceFactory,
+        probe: Arc<ProbeState>,
+        origin_payload: Arc<[u8]>,
+    ) -> Result<IDataObject> {
+        Self::create_with_entries(
+            vec![VirtualFileEntry::file(descriptor, source_factory)],
+            probe,
+            origin_payload,
+        )
+    }
+
+    pub(crate) fn create_with_entries(
+        entries: Vec<VirtualFileEntry>,
         probe: Arc<ProbeState>,
         origin_payload: Arc<[u8]>,
     ) -> Result<IDataObject> {
@@ -168,13 +228,12 @@ impl VirtualFileDataObject {
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
         }
-        validate_virtual_file_name(&descriptor.file_name)?;
+        validate_virtual_entries(&entries)?;
         let formats = ClipboardFormats::register()?;
         let object: IDataObject = Self {
             formats,
-            descriptor,
+            entries: Arc::from(entries),
             origin_payload,
-            source_factory,
             probe,
             async_mode: AtomicBool::new(false),
             in_operation: AtomicBool::new(false),
@@ -197,7 +256,18 @@ impl VirtualFileDataObject {
         {
             (-1, TYMED_HGLOBAL.0.cast_unsigned())
         } else if format.cfFormat == self.formats.contents {
-            (0, TYMED_ISTREAM.0.cast_unsigned())
+            let Ok(index) = usize::try_from(format.lindex) else {
+                return DV_E_LINDEX;
+            };
+            if self
+                .entries
+                .get(index)
+                .and_then(|entry| entry.source_factory.as_ref())
+                .is_none()
+            {
+                return DV_E_LINDEX;
+            }
+            (format.lindex, TYMED_ISTREAM.0.cast_unsigned())
         } else {
             return DV_E_FORMATETC;
         };
@@ -216,15 +286,25 @@ impl VirtualFileDataObject {
             return self.file_descriptor_medium();
         }
         if format.cfFormat == self.formats.contents {
-            let source = (self.source_factory)();
-            if source.len() != self.descriptor.size {
+            let index =
+                usize::try_from(format.lindex).map_err(|_| Error::from_hresult(DV_E_LINDEX))?;
+            let entry = self
+                .entries
+                .get(index)
+                .ok_or_else(|| Error::from_hresult(DV_E_LINDEX))?;
+            let source_factory = entry
+                .source_factory
+                .as_ref()
+                .ok_or_else(|| Error::from_hresult(DV_E_LINDEX))?;
+            let source = source_factory();
+            if source.len() != entry.descriptor.size {
                 return Err(Error::from_hresult(
                     windows::Win32::Foundation::E_UNEXPECTED,
                 ));
             }
             let stream = VirtualStream::create(
                 source,
-                Arc::clone(&self.descriptor.file_name),
+                Arc::clone(&entry.descriptor.file_name),
                 0,
                 Arc::clone(&self.probe),
             );
@@ -240,46 +320,69 @@ impl VirtualFileDataObject {
     }
 
     fn file_descriptor_medium(&self) -> Result<STGMEDIUM> {
-        let file_size = self.descriptor.size;
-        let file_size_high =
-            u32::try_from(file_size >> 32).expect("the high half of a u64 always fits in a u32");
-        let file_size_low = u32::try_from(file_size & u64::from(u32::MAX))
-            .expect("the low half of a u64 always fits in a u32");
-        let mut flags = (FD_ATTRIBUTES.0 | FD_FILESIZE.0 | FD_UNICODE.0).cast_unsigned();
-        if self.descriptor.creation_time.is_some() {
-            flags |= FD_CREATETIME.0.cast_unsigned();
-        }
-        if self.descriptor.last_access_time.is_some() {
-            flags |= FD_ACCESSTIME.0.cast_unsigned();
-        }
-        if self.descriptor.last_write_time.is_some() {
-            flags |= FD_WRITESTIME.0.cast_unsigned();
-        }
-        let mut descriptor = FILEDESCRIPTORW {
-            dwFlags: flags,
-            dwFileAttributes: self.descriptor.attributes,
-            nFileSizeHigh: file_size_high,
-            nFileSizeLow: file_size_low,
-            ftCreationTime: self.descriptor.creation_time.unwrap_or_default(),
-            ftLastAccessTime: self.descriptor.last_access_time.unwrap_or_default(),
-            ftLastWriteTime: self.descriptor.last_write_time.unwrap_or_default(),
-            ..Default::default()
-        };
-        let mut file_name = [0_u16; 260];
-        write_file_name(&mut file_name, &self.descriptor.file_name)?;
-        descriptor.cFileName = file_name;
-        let group = FILEGROUPDESCRIPTORW {
-            cItems: 1,
-            fgd: [descriptor],
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&raw const group).cast::<u8>(),
-                size_of::<FILEGROUPDESCRIPTORW>(),
+        let descriptor_offset = offset_of!(FILEGROUPDESCRIPTORW, fgd);
+        let allocation_size = descriptor_offset
+            .checked_add(
+                self.entries
+                    .len()
+                    .checked_mul(size_of::<FILEDESCRIPTORW>())
+                    .ok_or_else(|| {
+                        Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY)
+                    })?,
             )
-        };
-        hglobal_medium(bytes)
+            .ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY))?;
+        let mut bytes = vec![0_u8; allocation_size];
+        let item_count = u32::try_from(self.entries.len())
+            .map_err(|_| Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))?;
+        unsafe { bytes.as_mut_ptr().cast::<u32>().write_unaligned(item_count) };
+        for (index, entry) in self.entries.iter().enumerate() {
+            let descriptor = file_descriptor(&entry.descriptor)?;
+            let offset = descriptor_offset + index * size_of::<FILEDESCRIPTORW>();
+            unsafe {
+                bytes
+                    .as_mut_ptr()
+                    .add(offset)
+                    .cast::<FILEDESCRIPTORW>()
+                    .write_unaligned(descriptor);
+            }
+        }
+        hglobal_medium(&bytes)
     }
+}
+
+fn file_descriptor(metadata: &VirtualFileDescriptor) -> Result<FILEDESCRIPTORW> {
+    let file_size = metadata.size;
+    let file_size_high =
+        u32::try_from(file_size >> 32).expect("the high half of a u64 always fits in a u32");
+    let file_size_low = u32::try_from(file_size & u64::from(u32::MAX))
+        .expect("the low half of a u64 always fits in a u32");
+    let mut flags = (FD_ATTRIBUTES.0 | FD_UNICODE.0).cast_unsigned();
+    if !metadata.is_directory() {
+        flags |= FD_FILESIZE.0.cast_unsigned();
+    }
+    if metadata.creation_time.is_some() {
+        flags |= FD_CREATETIME.0.cast_unsigned();
+    }
+    if metadata.last_access_time.is_some() {
+        flags |= FD_ACCESSTIME.0.cast_unsigned();
+    }
+    if metadata.last_write_time.is_some() {
+        flags |= FD_WRITESTIME.0.cast_unsigned();
+    }
+    let mut descriptor = FILEDESCRIPTORW {
+        dwFlags: flags,
+        dwFileAttributes: metadata.attributes,
+        nFileSizeHigh: file_size_high,
+        nFileSizeLow: file_size_low,
+        ftCreationTime: metadata.creation_time.unwrap_or_default(),
+        ftLastAccessTime: metadata.last_access_time.unwrap_or_default(),
+        ftLastWriteTime: metadata.last_write_time.unwrap_or_default(),
+        ..Default::default()
+    };
+    let mut file_name = [0_u16; 260];
+    write_file_name(&mut file_name, &metadata.file_name)?;
+    descriptor.cFileName = file_name;
+    Ok(descriptor)
 }
 
 impl IDataObject_Impl for VirtualFileDataObject_Impl {
@@ -409,7 +512,12 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 return Err(Error::from_hresult(E_NOTIMPL));
             }
             Ok(FormatEnumerator::create(
-                self.formats.enumerated(),
+                self.formats.enumerated(
+                    self.entries
+                        .iter()
+                        .position(|entry| entry.source_factory.is_some())
+                        .and_then(|index| i32::try_from(index).ok()),
+                ),
                 Arc::clone(&self.probe),
             ))
         })
@@ -493,7 +601,7 @@ impl IDataObjectAsyncCapability_Impl for VirtualFileDataObject_Impl {
 }
 
 fn write_file_name(destination: &mut [u16; 260], name: &str) -> Result<()> {
-    validate_virtual_file_name(name)?;
+    validate_virtual_path(name)?;
     let encoded: Vec<u16> = name.encode_utf16().collect();
     destination[..encoded.len()].copy_from_slice(&encoded);
     destination[encoded.len()] = 0;
@@ -501,7 +609,23 @@ fn write_file_name(destination: &mut [u16; 260], name: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_virtual_file_name(name: &str) -> Result<()> {
+    validate_virtual_path_component(name)
+}
+
+pub(crate) fn validate_virtual_path(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.encode_utf16().count() >= 260 {
+        return Err(Error::from_hresult(DV_E_FORMATETC));
+    }
+    for component in name.split('\\') {
+        validate_virtual_path_component(component)?;
+    }
+    Ok(())
+}
+
+fn validate_virtual_path_component(name: &str) -> Result<()> {
     if name.is_empty()
+        || name == "."
+        || name == ".."
         || name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
         || name.ends_with([' ', '.'])
         || name.chars().any(char::is_control)
@@ -516,6 +640,83 @@ pub(crate) fn validate_virtual_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_virtual_entries(entries: &[VirtualFileEntry]) -> Result<()> {
+    if entries.is_empty() || entries.len() > MAX_VIRTUAL_ITEMS {
+        return Err(Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    }
+    for entry in entries {
+        let is_directory = entry.descriptor.is_directory();
+        if is_directory {
+            if entry.descriptor.size != 0 || entry.source_factory.is_some() {
+                return Err(Error::from_hresult(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                ));
+            }
+        } else if entry.source_factory.is_none() {
+            return Err(Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+    }
+
+    validate_virtual_descriptor_tree(
+        &entries
+            .iter()
+            .map(|entry| entry.descriptor.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) fn validate_virtual_descriptor_tree(
+    descriptors: &[VirtualFileDescriptor],
+) -> Result<()> {
+    if descriptors.is_empty() || descriptors.len() > MAX_VIRTUAL_ITEMS {
+        return Err(Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    }
+    let mut by_path = HashMap::with_capacity(descriptors.len());
+    let mut total_path_units = 0_usize;
+    for descriptor in descriptors {
+        validate_virtual_path(&descriptor.file_name)?;
+        if descriptor.file_name.split('\\').count() > MAX_VIRTUAL_DEPTH {
+            return Err(Error::from_hresult(DV_E_FORMATETC));
+        }
+        total_path_units = total_path_units
+            .checked_add(descriptor.file_name.encode_utf16().count())
+            .ok_or_else(|| Error::from_hresult(DV_E_FORMATETC))?;
+        if total_path_units > MAX_TOTAL_VIRTUAL_PATH_U16 {
+            return Err(Error::from_hresult(DV_E_FORMATETC));
+        }
+        if descriptor.is_directory() && descriptor.size != 0 {
+            return Err(Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+        let key = case_fold_path(&descriptor.file_name);
+        if by_path.insert(key, descriptor.is_directory()).is_some() {
+            return Err(Error::from_hresult(DV_E_FORMATETC));
+        }
+    }
+
+    for descriptor in descriptors {
+        let components: Vec<&str> = descriptor.file_name.split('\\').collect();
+        for depth in 1..components.len() {
+            let parent = components[..depth].join("\\");
+            if by_path.get(&case_fold_path(&parent)) != Some(&true) {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn case_fold_path(path: &str) -> String {
+    path.chars().flat_map(char::to_lowercase).collect()
+}
+
 fn is_reserved_dos_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name);
     if stem.eq_ignore_ascii_case("CON")
@@ -526,8 +727,21 @@ fn is_reserved_dos_name(name: &str) -> bool {
     {
         return true;
     }
+    let upper = stem.to_ascii_uppercase();
+    if upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    {
+        return true;
+    }
     matches!(
-        stem.to_ascii_uppercase().as_str(),
+        upper.as_str(),
         "COM1"
             | "COM2"
             | "COM3"
@@ -591,7 +805,7 @@ mod tests {
         DV_E_DVASPECT, DV_E_DVTARGETDEVICE, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_POINTER,
         FILETIME, S_FALSE, S_OK,
     };
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
     use windows::Win32::System::Com::{
         DATADIR_GET, FORMATETC, IBindCtx, IStream, TYMED_HGLOBAL, TYMED_ISTREAM,
     };
@@ -604,7 +818,9 @@ mod tests {
     use windows::core::Interface;
 
     use super::{
-        ClipboardFormats, VirtualFileDataObject, VirtualFileDescriptor, format_etc, write_file_name,
+        ClipboardFormats, MAX_VIRTUAL_DEPTH, MAX_VIRTUAL_ITEMS, VirtualFileDataObject,
+        VirtualFileDescriptor, VirtualFileEntry, format_etc, validate_virtual_descriptor_tree,
+        write_file_name,
     };
     use crate::clipboard::probe::ProbeState;
     use crate::clipboard::source::{MemorySource, ReadAtSource};
@@ -762,6 +978,140 @@ mod tests {
 
         let _ = unsafe { GlobalUnlock(global) };
         unsafe { ReleaseStgMedium(&mut medium) };
+    }
+
+    #[test]
+    fn descriptor_group_and_lindex_support_directories_and_multiple_files() {
+        let probe = Arc::new(ProbeState::default());
+        let alpha: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"alpha"[..]));
+        let beta: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"beta"[..]));
+        let alpha_factory = {
+            let source = Arc::clone(&alpha);
+            Arc::new(move || Arc::clone(&source)) as super::SourceFactory
+        };
+        let beta_factory = {
+            let source = Arc::clone(&beta);
+            Arc::new(move || Arc::clone(&source)) as super::SourceFactory
+        };
+        let object = VirtualFileDataObject::create_with_entries(
+            vec![
+                VirtualFileEntry::directory(VirtualFileDescriptor {
+                    file_name: Arc::from("资料"),
+                    size: 0,
+                    attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                    creation_time: None,
+                    last_access_time: None,
+                    last_write_time: None,
+                }),
+                VirtualFileEntry::file(
+                    VirtualFileDescriptor::basic(Arc::from("资料\\α.txt"), 5),
+                    alpha_factory,
+                ),
+                VirtualFileEntry::file(
+                    VirtualFileDescriptor::basic(Arc::from("emoji-🚢.txt"), 4),
+                    beta_factory,
+                ),
+            ],
+            Arc::clone(&probe),
+            Arc::from(&b"multi-offer"[..]),
+        )
+        .unwrap();
+        let formats = ClipboardFormats::register().unwrap();
+
+        let descriptor_format = format_etc(formats.descriptor, -1, TYMED_HGLOBAL.0.cast_unsigned());
+        let mut descriptor_medium = unsafe { object.GetData(&descriptor_format) }.unwrap();
+        let global = unsafe { descriptor_medium.u.hGlobal };
+        let locked = unsafe { GlobalLock(global) };
+        assert_eq!(unsafe { locked.cast::<u32>().read_unaligned() }, 3);
+        let first_descriptor = unsafe {
+            locked
+                .cast::<u8>()
+                .add(std::mem::offset_of!(FILEGROUPDESCRIPTORW, fgd))
+                .cast::<FILEDESCRIPTORW>()
+        };
+        let descriptors: Vec<FILEDESCRIPTORW> = (0..3)
+            .map(|index| unsafe { first_descriptor.add(index).read_unaligned() })
+            .collect();
+        let names: Vec<String> = descriptors
+            .iter()
+            .map(|descriptor| {
+                let file_name =
+                    unsafe { std::ptr::addr_of!(descriptor.cFileName).read_unaligned() };
+                let length = file_name
+                    .iter()
+                    .position(|character| *character == 0)
+                    .unwrap();
+                String::from_utf16(&file_name[..length]).unwrap()
+            })
+            .collect();
+        assert_eq!(names, ["资料", "资料\\α.txt", "emoji-🚢.txt"]);
+        assert_ne!(
+            descriptors[0].dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0,
+            0
+        );
+        assert_eq!(descriptors[0].dwFlags & FD_FILESIZE.0.cast_unsigned(), 0);
+        let _ = unsafe { GlobalUnlock(global) };
+        unsafe { ReleaseStgMedium(&mut descriptor_medium) };
+
+        let directory = format_etc(formats.contents, 0, TYMED_ISTREAM.0.cast_unsigned());
+        assert_eq!(unsafe { object.QueryGetData(&directory) }, DV_E_LINDEX);
+        for (index, expected) in [(1, b"alpha".as_slice()), (2, b"beta".as_slice())] {
+            let contents = format_etc(formats.contents, index, TYMED_ISTREAM.0.cast_unsigned());
+            let mut medium = unsafe { object.GetData(&contents) }.unwrap();
+            let stream: IStream = unsafe {
+                let stream = &*medium.u.pstm;
+                stream.as_ref().unwrap().clone()
+            };
+            let mut bytes = [0_u8; 5];
+            let mut read = 0;
+            assert_eq!(
+                unsafe {
+                    stream.Read(
+                        bytes.as_mut_ptr().cast::<c_void>(),
+                        u32::try_from(expected.len()).unwrap(),
+                        Some(&mut read),
+                    )
+                },
+                S_OK
+            );
+            assert_eq!(&bytes[..expected.len()], expected);
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
+    }
+
+    #[test]
+    fn virtual_tree_rejects_collisions_and_missing_directory_descriptors() {
+        let probe = Arc::new(ProbeState::default());
+        let source: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"x"[..]));
+        let factory = {
+            let source = Arc::clone(&source);
+            Arc::new(move || Arc::clone(&source)) as super::SourceFactory
+        };
+        let missing_parent = VirtualFileDataObject::create_with_entries(
+            vec![VirtualFileEntry::file(
+                VirtualFileDescriptor::basic(Arc::from("missing\\child.txt"), 1),
+                Arc::clone(&factory),
+            )],
+            Arc::clone(&probe),
+            Arc::from(&b"origin"[..]),
+        );
+        assert!(missing_parent.is_err());
+
+        let collision = VirtualFileDataObject::create_with_entries(
+            vec![
+                VirtualFileEntry::file(
+                    VirtualFileDescriptor::basic(Arc::from("Readme.txt"), 1),
+                    Arc::clone(&factory),
+                ),
+                VirtualFileEntry::file(
+                    VirtualFileDescriptor::basic(Arc::from("README.TXT"), 1),
+                    factory,
+                ),
+            ],
+            probe,
+            Arc::from(&b"origin"[..]),
+        );
+        assert!(collision.is_err());
     }
 
     #[test]
@@ -962,6 +1312,10 @@ mod tests {
         for invalid in [
             "",
             "..\\escape.txt",
+            "C:\\absolute.txt",
+            "\\\\server\\share.txt",
+            "\\\\?\\C:\\device.txt",
+            "nested\\\\empty.txt",
             "nested/file.txt",
             "bad.",
             "bad ",
@@ -972,6 +1326,8 @@ mod tests {
             "CON",
             "nul.txt",
             "Com1.log",
+            "COM¹.txt",
+            "LPT².log",
             "LPT9",
         ] {
             assert!(
@@ -980,6 +1336,29 @@ mod tests {
             );
         }
         assert!(write_file_name(&mut destination, &"x".repeat(260)).is_err());
+    }
+
+    #[test]
+    fn virtual_tree_rejects_excessive_depth_and_total_path_units() {
+        let too_deep = VirtualFileDescriptor::basic(
+            Arc::from(
+                std::iter::repeat_n("d", MAX_VIRTUAL_DEPTH + 1)
+                    .collect::<Vec<_>>()
+                    .join("\\"),
+            ),
+            0,
+        );
+        assert!(validate_virtual_descriptor_tree(&[too_deep]).is_err());
+
+        let oversized = (0..MAX_VIRTUAL_ITEMS)
+            .map(|index| {
+                VirtualFileDescriptor::basic(
+                    Arc::from(format!("{index:04}-{}.bin", "x".repeat(64))),
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_virtual_descriptor_tree(&oversized).is_err());
     }
 
     #[test]

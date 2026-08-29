@@ -169,7 +169,7 @@ fn run() -> Result<(), String> {
             );
             run_secure_source_probe(SecureSourceProbeOptions {
                 listen_address: parsed.listen_address,
-                source_path: parsed.source_path,
+                source_paths: parsed.source_paths,
                 offer_ttl: parsed.offer_ttl,
                 transfer_ttl: parsed.transfer_ttl,
                 io_timeout: parsed.io_timeout,
@@ -245,7 +245,7 @@ fn print_usage() {
         "  clipferry identity-test-generate --cert-out <certificate.der> --key-out <private-key.der>"
     );
     println!(
-        "  clipferry secure-source-test --listen <private-ip:port> --file <path> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--offer-ttl-seconds <seconds>] [--transfer-ttl-seconds <seconds>] [--io-timeout-seconds <seconds>] [--lifetime-seconds <seconds>]"
+        "  clipferry secure-source-test --listen <private-ip:port> --file <file-or-directory> [--file <additional-path> ...] --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--offer-ttl-seconds <seconds>] [--transfer-ttl-seconds <seconds>] [--io-timeout-seconds <seconds>] [--lifetime-seconds <seconds>]"
     );
     println!(
         "  clipferry secure-fetch-test --connect <private-ip:port> --output <new-path> --identity-cert <certificate.der> --identity-key <private-key.der> --peer-cert <certificate.der> --peer-fingerprint <SHA-256> [--io-timeout-seconds <seconds>]"
@@ -467,7 +467,7 @@ fn resolve_store(root: Option<std::path::PathBuf>) -> Result<DeviceStore, String
 
 struct ParsedSecureSource {
     listen_address: std::net::SocketAddr,
-    source_path: std::path::PathBuf,
+    source_paths: Vec<std::path::PathBuf>,
     offer_ttl: Duration,
     transfer_ttl: Duration,
     io_timeout: Duration,
@@ -585,7 +585,7 @@ fn parse_secure_source_options(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<ParsedSecureSource, String> {
     let mut listen_address = None;
-    let mut source_path = None;
+    let mut source_paths = Vec::new();
     let mut offer_ttl_seconds = 900_u64;
     let mut transfer_ttl_seconds = 3600_u64;
     let mut io_timeout_seconds = 30_u64;
@@ -596,7 +596,7 @@ fn parse_secure_source_options(
             "--listen" => {
                 listen_address = Some(parse_private_socket(&mut arguments, &argument)?);
             }
-            "--file" => source_path = Some(parse_path(&mut arguments, &argument)?),
+            "--file" => source_paths.push(parse_path(&mut arguments, &argument)?),
             "--offer-ttl-seconds" => {
                 offer_ttl_seconds = parse_value(&mut arguments, &argument)?;
             }
@@ -632,7 +632,9 @@ fn parse_secure_source_options(
     }
     Ok(ParsedSecureSource {
         listen_address: listen_address.ok_or_else(|| "--listen is required".to_owned())?,
-        source_path: source_path.ok_or_else(|| "--file is required".to_owned())?,
+        source_paths: (!source_paths.is_empty())
+            .then_some(source_paths)
+            .ok_or_else(|| "at least one --file is required".to_owned())?,
         offer_ttl: Duration::from_secs(offer_ttl_seconds),
         transfer_ttl: Duration::from_secs(transfer_ttl_seconds),
         io_timeout: Duration::from_secs(io_timeout_seconds),

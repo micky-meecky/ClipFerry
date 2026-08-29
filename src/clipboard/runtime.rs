@@ -28,10 +28,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Error, HRESULT, Interface, Result, w};
 
-use super::data_object::VirtualFileDataObject;
+use super::data_object::{SourceFactory, VirtualFileDataObject, VirtualFileEntry};
 use super::local_file::{
-    CaptureFormats, ClipboardCapture, FileSnapshot, LocalFileOffer, LocalOfferRegistry,
-    capture_single_file_from_clipboard,
+    CaptureFormats, ClipboardCapture, FileTreeSnapshot, LocalFileOffer, LocalOfferRegistry,
+    capture_files_from_clipboard,
 };
 use super::loopback::{
     DEFAULT_MAX_WORKERS, LOOPBACK_FILE_ID, LOOPBACK_TEST_FILE_NAME, LoopbackControlClient,
@@ -82,7 +82,7 @@ pub struct FileCaptureProbeOptions {
 
 pub struct SecureSourceProbeOptions {
     pub listen_address: SocketAddr,
-    pub source_path: PathBuf,
+    pub source_paths: Vec<PathBuf>,
     pub offer_ttl: Duration,
     pub transfer_ttl: Duration,
     pub io_timeout: Duration,
@@ -288,11 +288,23 @@ struct CapturedClipboardLease {
 impl CapturedClipboardLease {
     fn register(offer: Arc<LocalFileOffer>, async_mode: bool) -> Result<Self> {
         let probe = Arc::new(ProbeState::quiet());
-        let concrete_source = offer.source();
-        let source: Arc<dyn ReadAtSource> = concrete_source.clone();
-        let object = VirtualFileDataObject::create_with_descriptor(
-            offer.descriptor(),
-            source,
+        let entries = offer
+            .entries()
+            .iter()
+            .map(|entry| {
+                let descriptor = entry.descriptor();
+                let Some(source) = entry.source() else {
+                    return VirtualFileEntry::directory(descriptor);
+                };
+                let source_factory: SourceFactory = Arc::new(move || {
+                    let source: Arc<dyn ReadAtSource> = source.clone();
+                    source
+                });
+                VirtualFileEntry::file(descriptor, source_factory)
+            })
+            .collect();
+        let object = VirtualFileDataObject::create_with_entries(
+            entries,
             Arc::clone(&probe),
             offer.origin_payload(),
         )?;
@@ -301,7 +313,7 @@ impl CapturedClipboardLease {
             unsafe { capability.SetAsyncMode(true) }?;
         }
         ole_set_clipboard_with_retry(&object)?;
-        if concrete_source.read_calls() != 0 || concrete_source.bytes_read() != 0 {
+        if offer.read_calls() != 0 || offer.bytes_read() != 0 {
             return Err(Error::from_hresult(E_UNEXPECTED));
         }
         probe.record(
@@ -327,15 +339,14 @@ impl CapturedClipboardLease {
 impl Drop for CapturedClipboardLease {
     fn drop(&mut self) {
         let status = self.current_status();
-        let source = self.offer.source();
         self.probe.record(
             "CapturedClipboardLease::drop",
             format_args!(
                 "was_current={} status={:#010X} read_calls={} bytes_read={}",
                 status == S_OK,
                 status.0.cast_unsigned(),
-                source.read_calls(),
-                source.bytes_read()
+                self.offer.read_calls(),
+                self.offer.bytes_read()
             ),
         );
         if status == S_OK {
@@ -405,9 +416,9 @@ impl FileCaptureSession {
 
         self.registry.revoke_current();
         self.lease.take();
-        match capture_single_file_from_clipboard(window, formats) {
-            Ok(ClipboardCapture::Candidate { path, sequence }) => {
-                self.accept_candidate(&path, sequence);
+        match capture_files_from_clipboard(window, formats) {
+            Ok(ClipboardCapture::Candidates { paths, sequence }) => {
+                self.accept_candidates(&paths, sequence);
             }
             Ok(ClipboardCapture::Rejected(reason)) => {
                 self.rejected = self.rejected.saturating_add(1);
@@ -429,8 +440,8 @@ impl FileCaptureSession {
         let _ = std::io::stdout().flush();
     }
 
-    fn accept_candidate(&mut self, path: &std::path::Path, sequence: u32) {
-        let snapshot = match FileSnapshot::capture(path) {
+    fn accept_candidates(&mut self, paths: &[PathBuf], sequence: u32) {
+        let snapshot = match FileTreeSnapshot::capture(paths) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.rejected = self.rejected.saturating_add(1);
@@ -438,7 +449,7 @@ impl FileCaptureSession {
                 return;
             }
         };
-        let offer = match self.registry.publish(snapshot, self.offer_ttl) {
+        let offer = match self.registry.publish_tree(&snapshot, self.offer_ttl) {
             Ok(offer) => offer,
             Err(error) => {
                 self.rejected = self.rejected.saturating_add(1);
@@ -453,12 +464,13 @@ impl FileCaptureSession {
             Ok(next_lease) => {
                 self.accepted = self.accepted.saturating_add(1);
                 println!(
-                    "CAPTURE accepted=true sequence={} offer={:?} file_id={:?} file={} size={} content_reads=0 ttl_ms={}",
+                    "CAPTURE accepted=true sequence={} offer={:?} items={} files={} directories={} total_size={} content_reads=0 ttl_ms={}",
                     sequence,
                     offer.offer_id(),
-                    offer.file_id(),
-                    offer.file_name(),
-                    offer.size(),
+                    offer.entries().len(),
+                    offer.file_count(),
+                    offer.directory_count(),
+                    offer.total_size(),
                     offer.remaining_ttl().as_millis()
                 );
                 self.lease = Some(next_lease);
@@ -484,15 +496,14 @@ impl FileCaptureSession {
                 ..CaptureSummary::default()
             };
         };
-        let source = current.offer.source();
         CaptureSummary {
             current: current.is_current(),
             accepted: self.accepted,
             rejected: self.rejected,
             ignored: self.ignored,
             offer_age_ms: current.offer.age().as_millis(),
-            read_calls: source.read_calls(),
-            bytes_read: source.bytes_read(),
+            read_calls: current.offer.read_calls(),
+            bytes_read: current.offer.bytes_read(),
             events: current.probe.event_count(),
             dropped_events: current.probe.dropped_events(),
         }
@@ -773,17 +784,17 @@ pub fn run_loopback_probe(options: LoopbackProbeOptions) -> Result<()> {
     Ok(())
 }
 
-/// Serves one captured local file through the stage-4 pinned mutual-TLS protocol.
+/// Serves one or more captured local files/directories through the mutual-TLS protocol.
 ///
 /// # Errors
 ///
 /// Returns an I/O, source validation, TLS, protocol, or worker-start error.
 pub fn run_secure_source_probe(options: SecureSourceProbeOptions) -> std::io::Result<()> {
-    let snapshot = FileSnapshot::capture(&options.source_path)
+    let snapshot = FileTreeSnapshot::capture(&options.source_paths)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut registry = LocalOfferRegistry::default();
     let local_offer = registry
-        .publish(snapshot, options.offer_ttl)
+        .publish_tree(&snapshot, options.offer_ttl)
         .map_err(windows_to_io)?;
     let offered = SecureOfferedFile::from_local_offer(&local_offer)?;
     let mut server = match options.tls {
@@ -807,18 +818,47 @@ pub fn run_secure_source_probe(options: SecureSourceProbeOptions) -> std::io::Re
         )?,
     };
     let manifest = server.manifest();
-    println!(
-        "READY mode=secure-source tls=1.3 mtls=true address={} offer={} file_id={} file={} size={} content_reads=0 lifetime={}",
-        server.address(),
-        manifest.offer_id,
-        manifest.file_id,
-        manifest.descriptor.file_name,
-        manifest.descriptor.size,
-        options.lifetime.map_or_else(
-            || "infinite".to_owned(),
-            |duration| format!("{}s", duration.as_secs())
-        )
-    );
+    let files = manifest
+        .entries
+        .iter()
+        .filter(|entry| !entry.descriptor.is_directory())
+        .count();
+    let total_size: u64 = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.descriptor.size)
+        .sum();
+    if manifest.entries.len() == 1 {
+        let entry = &manifest.entries[0];
+        println!(
+            "READY mode=secure-source tls=1.3 mtls=true address={} offer={} file_id={} file={} size={} items=1 files={} directories={} content_reads=0 lifetime={}",
+            server.address(),
+            manifest.offer_id,
+            entry.file_id,
+            entry.descriptor.file_name,
+            entry.descriptor.size,
+            files,
+            usize::from(entry.descriptor.is_directory()),
+            options.lifetime.map_or_else(
+                || "infinite".to_owned(),
+                |duration| format!("{}s", duration.as_secs())
+            )
+        );
+    } else {
+        println!(
+            "READY mode=secure-source tls=1.3 mtls=true address={} offer={} items={} files={} directories={} total_size={} content_reads=0 lifetime={}",
+            server.address(),
+            manifest.offer_id,
+            manifest.entries.len(),
+            files,
+            manifest.entries.len() - files,
+            total_size,
+            options.lifetime.map_or_else(
+                || "infinite".to_owned(),
+                |duration| format!("{}s", duration.as_secs())
+            )
+        );
+    }
     println!("CONTROL commands=status,quit");
     let _ = std::io::stdout().flush();
 
@@ -844,7 +884,14 @@ pub fn run_secure_fetch_probe(
         ));
     }
     let manifest = options.client.fetch_manifest()?;
-    let source = SecureRemoteSource::new(options.client, manifest.clone());
+    if manifest.entries.len() != 1 || manifest.entries[0].descriptor.is_directory() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "single-file secure fetch cannot materialize a directory tree",
+        ));
+    }
+    let entry = manifest.entries[0].clone();
+    let source = SecureRemoteSource::new_for_entry(options.client, manifest, entry.clone());
     let temporary_path = unique_partial_path(&options.output_path)?;
     let mut temporary = PartialFileGuard::create(temporary_path)?;
     let mut offset = 0_u64;
@@ -861,7 +908,7 @@ pub fn run_secure_fetch_probe(
             .checked_add(read as u64)
             .ok_or_else(|| std::io::Error::other("download offset overflow"))?;
     }
-    if offset != manifest.descriptor.size {
+    if offset != entry.descriptor.size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "download size differs from authenticated manifest",
@@ -892,20 +939,33 @@ pub fn run_secure_receiver_probe(options: &SecureReceiverProbeOptions) -> Result
     let _apartment = OleApartment::initialize()?;
     let window = ClipboardWindow::create()?;
     let registry = Arc::new(RemoteTransferRegistry::default());
-    let source_factory = {
-        let client = options.client.clone();
-        let manifest = manifest.clone();
-        let registry = Arc::clone(&registry);
-        Arc::new(move || {
-            let source = registry.create_source(client.clone(), manifest.clone());
-            let source: Arc<dyn ReadAtSource> = source;
-            source
-        }) as Arc<dyn Fn() -> Arc<dyn ReadAtSource> + Send + Sync>
-    };
+    let entries = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let descriptor = entry.descriptor.clone();
+            if descriptor.is_directory() {
+                return VirtualFileEntry::directory(descriptor);
+            }
+            let client = options.client.clone();
+            let manifest = manifest.clone();
+            let entry = entry.clone();
+            let registry = Arc::clone(&registry);
+            let source_factory: SourceFactory = Arc::new(move || {
+                let source = registry.create_source_for_entry(
+                    client.clone(),
+                    manifest.clone(),
+                    entry.clone(),
+                );
+                let source: Arc<dyn ReadAtSource> = source;
+                source
+            });
+            VirtualFileEntry::file(descriptor, source_factory)
+        })
+        .collect();
     let probe = Arc::new(ProbeState::quiet());
-    let object = VirtualFileDataObject::create_with_source_factory(
-        manifest.descriptor.clone(),
-        source_factory,
+    let object = VirtualFileDataObject::create_with_entries(
+        entries,
         Arc::clone(&probe),
         manifest.origin_payload(),
     )?;
@@ -920,12 +980,23 @@ pub fn run_secure_receiver_probe(options: &SecureReceiverProbeOptions) -> Result
         probe,
         registry: Arc::clone(&registry),
     };
+    let files = manifest
+        .entries
+        .iter()
+        .filter(|entry| !entry.descriptor.is_directory())
+        .count();
+    let total_size: u64 = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.descriptor.size)
+        .sum();
     println!(
-        "READY mode=secure-receiver tls=1.3 mtls=true offer={} file_id={} file={} size={} content_reads=0 async_mode={} lifetime={}",
+        "READY mode=secure-receiver tls=1.3 mtls=true offer={} items={} files={} directories={} total_size={} content_reads=0 async_mode={} lifetime={}",
         manifest.offer_id,
-        manifest.file_id,
-        manifest.descriptor.file_name,
-        manifest.descriptor.size,
+        manifest.entries.len(),
+        files,
+        manifest.entries.len() - files,
+        total_size,
         options.async_mode,
         options.lifetime.map_or_else(
             || "infinite".to_owned(),
@@ -942,21 +1013,18 @@ pub fn run_secure_receiver_probe(options: &SecureReceiverProbeOptions) -> Result
         let _ = unsafe { KillTimer(None, timer) };
     }
     let current_status = lease.current_status();
-    let latest = registry.latest_started().ok();
-    let transfer_state = match latest.as_ref() {
+    let group = registry.status_all().ok();
+    let transfer_state = match group.as_ref() {
         None => "not-started".to_owned(),
-        Some(source) => source.status().map_or_else(
-            |error| format!("unavailable({})", error.kind()),
-            |status| format!("{:?}", status.state),
-        ),
+        Some(status) => format!("{:?}", status.state),
     };
     println!(
         "STOP current_clipboard={} status={:#010X} live_sources={} read_calls={} bytes_read={} transfer_state={}",
         current_status == S_OK,
         current_status.0.cast_unsigned(),
         registry.live_sources(),
-        latest.as_ref().map_or(0, |source| source.read_calls()),
-        latest.as_ref().map_or(0, |source| source.bytes_read()),
+        group.as_ref().map_or(0, |status| status.read_calls),
+        group.as_ref().map_or(0, |status| status.bytes_read),
         transfer_state
     );
     Ok(())
@@ -1039,28 +1107,17 @@ fn spawn_secure_receiver_control(
                 };
                 let command = line.trim().to_ascii_lowercase();
                 if command == "quit" {
-                    if let Ok(source) = registry.latest_started() {
-                        let _ = source.cancel();
-                    }
+                    let _ = registry.cancel_all();
                     let _ = unsafe {
                         PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
                     };
                     break;
                 }
-                let source = match registry.latest_started() {
-                    Ok(source) => source,
-                    Err(error) => {
-                        if !command.is_empty() {
-                            eprintln!("CONTROL state=not-started command={command} error={error}");
-                        }
-                        continue;
-                    }
-                };
                 let result = match command.as_str() {
-                    "pause" => source.pause(),
-                    "resume" => source.resume(),
-                    "cancel" => source.cancel(),
-                    "status" => source.status(),
+                    "pause" => registry.pause_all(),
+                    "resume" => registry.resume_all(),
+                    "cancel" => registry.cancel_all(),
+                    "status" => registry.status_all(),
                     "" => continue,
                     _ => {
                         eprintln!("CONTROL unknown={command:?}");
@@ -1069,11 +1126,12 @@ fn spawn_secure_receiver_control(
                 };
                 match result {
                     Ok(status) => println!(
-                        "CONTROL state={:?} unique_bytes={} read_calls={} bytes_read={}",
+                        "CONTROL state={:?} streams={} unique_bytes={} read_calls={} bytes_read={}",
                         status.state,
+                        status.started_transfers,
                         status.unique_bytes,
-                        source.read_calls(),
-                        source.bytes_read()
+                        status.read_calls,
+                        status.bytes_read
                     ),
                     Err(error) => eprintln!("CONTROL command={command} error={error}"),
                 }

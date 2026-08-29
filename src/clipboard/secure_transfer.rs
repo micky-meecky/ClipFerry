@@ -17,16 +17,21 @@ use crate::security::{
     TrustedTlsServer,
 };
 
-use super::data_object::{VirtualFileDescriptor, validate_virtual_file_name};
+use super::data_object::{
+    MAX_VIRTUAL_ITEMS, VirtualFileDescriptor, validate_virtual_descriptor_tree,
+};
 use super::local_file::LocalFileOffer;
 use super::source::ReadAtSource;
 use super::transfer::{GeneratedSource, TransferControl};
 
 const MAGIC: [u8; 4] = *b"CFS4";
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const FRAME_HEADER_LEN: usize = 20;
+const MANIFEST_HEADER_LEN: usize = 29;
+const MANIFEST_ENTRY_FIXED_LEN: usize = 55;
 pub const MAX_SECURE_RANGE_BYTES: usize = 256 * 1024;
-const MAX_FRAME_PAYLOAD: usize = MAX_SECURE_RANGE_BYTES + 256;
+pub const MAX_SECURE_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_PAYLOAD: usize = MAX_SECURE_MANIFEST_BYTES;
 const MAX_TRANSFERS: usize = 64;
 const MAX_BEGIN_NONCES: usize = 4_096;
 const MAX_TRACKED_RANGES: usize = 4_096;
@@ -61,9 +66,14 @@ impl std::fmt::Display for ProtocolId {
 #[derive(Clone, Debug)]
 pub struct OfferManifest {
     pub offer_id: ProtocolId,
+    pub entries: Arc<[OfferManifestEntry]>,
+    pub ttl: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfferManifestEntry {
     pub file_id: ProtocolId,
     pub descriptor: VirtualFileDescriptor,
-    pub ttl: Duration,
 }
 
 impl OfferManifest {
@@ -84,7 +94,7 @@ impl ClipFerryOrigin {
 #[derive(Clone)]
 pub struct SecureOfferedFile {
     manifest: OfferManifest,
-    source: Arc<dyn ReadAtSource>,
+    sources: Arc<HashMap<ProtocolId, Arc<dyn ReadAtSource>>>,
     expires_at: Instant,
 }
 
@@ -100,23 +110,60 @@ impl SecureOfferedFile {
         source: Arc<dyn ReadAtSource>,
         ttl: Duration,
     ) -> io::Result<Self> {
-        if ttl.is_zero() || descriptor.size != source.len() {
+        Self::new_tree(vec![(descriptor, Some(source))], ttl)
+    }
+
+    /// Creates one bounded virtual directory tree. Directory descriptors have no source; every
+    /// ordinary file has an independent deferred random-access source and protocol identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid descriptors, missing or mismatched sources, excessive tree
+    /// size, zero lifetime, arithmetic overflow, or unavailable secure randomness.
+    pub fn new_tree(
+        entries: Vec<(VirtualFileDescriptor, Option<Arc<dyn ReadAtSource>>)>,
+        ttl: Duration,
+    ) -> io::Result<Self> {
+        if ttl.is_zero() || entries.is_empty() || entries.len() > MAX_VIRTUAL_ITEMS {
             return Err(invalid_data("invalid secure offer size or lifetime"));
         }
-        validate_virtual_file_name(&descriptor.file_name).map_err(invalid_windows)?;
+        let descriptors: Vec<VirtualFileDescriptor> = entries
+            .iter()
+            .map(|(descriptor, _)| descriptor.clone())
+            .collect();
+        validate_virtual_descriptor_tree(&descriptors).map_err(invalid_windows)?;
         let offer_id = ProtocolId::random()?;
-        let file_id = ProtocolId::random()?;
+        let mut manifest_entries = Vec::with_capacity(entries.len());
+        let mut sources = HashMap::with_capacity(entries.len());
+        for (descriptor, source) in entries {
+            if descriptor.is_directory() != source.is_none()
+                || source
+                    .as_ref()
+                    .is_some_and(|source| descriptor.size != source.len())
+            {
+                return Err(invalid_data(
+                    "secure offer source does not match descriptor",
+                ));
+            }
+            let file_id = ProtocolId::random()?;
+            if let Some(source) = source {
+                sources.insert(file_id, source);
+            }
+            manifest_entries.push(OfferManifestEntry {
+                file_id,
+                descriptor,
+            });
+        }
         let expires_at = Instant::now()
             .checked_add(ttl)
             .ok_or_else(|| invalid_data("secure offer lifetime is too large"))?;
         Ok(Self {
             manifest: OfferManifest {
                 offer_id,
-                file_id,
-                descriptor,
+                entries: Arc::from(manifest_entries),
                 ttl,
             },
-            source,
+            sources: Arc::new(sources),
             expires_at,
         })
     }
@@ -136,8 +183,18 @@ impl SecureOfferedFile {
     }
 
     pub(crate) fn from_local_offer(offer: &LocalFileOffer) -> io::Result<Self> {
-        let source: Arc<dyn ReadAtSource> = offer.source();
-        Self::new(offer.descriptor(), source, offer.remaining_ttl())
+        let entries = offer
+            .entries()
+            .iter()
+            .map(|entry| {
+                let source = entry.source().map(|source| {
+                    let source: Arc<dyn ReadAtSource> = source;
+                    source
+                });
+                (entry.descriptor(), source)
+            })
+            .collect();
+        Self::new_tree(entries, offer.remaining_ttl())
     }
 
     #[must_use]
@@ -145,6 +202,17 @@ impl SecureOfferedFile {
         let mut manifest = self.manifest.clone();
         manifest.ttl = self.expires_at.saturating_duration_since(Instant::now());
         manifest
+    }
+
+    fn source(&self, file_id: ProtocolId) -> Option<Arc<dyn ReadAtSource>> {
+        self.sources.get(&file_id).cloned()
+    }
+
+    fn manifest_entry(&self, file_id: ProtocolId) -> Option<&OfferManifestEntry> {
+        self.manifest
+            .entries
+            .iter()
+            .find(|entry| entry.file_id == file_id)
     }
 }
 
@@ -347,12 +415,17 @@ impl ServerState {
         &self,
         peer: CertificateFingerprint,
         offer_id: ProtocolId,
+        file_id: ProtocolId,
         nonce: [u8; 32],
     ) -> WireResult<TransferCredentials> {
         self.ensure_peer_allowed(peer)?;
         let now = Instant::now();
         if offer_id != self.offered.manifest.offer_id || now >= self.offered.expires_at {
             return Err(ResponseStatus::Expired);
+        }
+        if self.offered.source(file_id).is_none() {
+            self.metrics.denied_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(ResponseStatus::Denied);
         }
         let mut inner = self.inner.lock().map_err(|_| ResponseStatus::Internal)?;
         inner.transfers.retain(|_, transfer| {
@@ -379,7 +452,7 @@ impl ServerState {
         let session = Arc::new(TransferSession {
             authorized_peer: peer,
             offer_id,
-            file_id: self.offered.manifest.file_id,
+            file_id,
             transfer_id,
             capability: random_bytes().map_err(|_| ResponseStatus::Internal)?,
             server_nonce: random_bytes().map_err(|_| ResponseStatus::Internal)?,
@@ -545,12 +618,19 @@ impl ServerState {
 
         self.ensure_peer_allowed(peer)?;
 
-        let available = self.offered.manifest.descriptor.size.saturating_sub(offset);
+        let source = self
+            .offered
+            .source(session.file_id)
+            .ok_or(ResponseStatus::Denied)?;
+        let descriptor = &self
+            .offered
+            .manifest_entry(session.file_id)
+            .ok_or(ResponseStatus::Denied)?
+            .descriptor;
+        let available = descriptor.size.saturating_sub(offset);
         let count = usize::try_from(available.min(requested as u64)).unwrap_or(requested);
         let mut bytes = vec![0_u8; count];
-        let read = self
-            .offered
-            .source
+        let read = source
             .read_at(offset, &mut bytes)
             .map_err(|_| ResponseStatus::SourceChanged)?;
         bytes.truncate(read);
@@ -968,32 +1048,42 @@ fn encode_manifest_response(state: &ServerState, payload: &[u8]) -> WireResult<V
     let mut response = Vec::new();
     response.push(ResponseStatus::Ok.encode());
     response.extend_from_slice(&manifest.offer_id.0);
-    response.extend_from_slice(&manifest.file_id.0);
-    response.extend_from_slice(&manifest.descriptor.size.to_be_bytes());
-    response.extend_from_slice(&manifest.descriptor.attributes.to_be_bytes());
-    let mut time_flags = 0_u8;
-    if manifest.descriptor.creation_time.is_some() {
-        time_flags |= 1;
-    }
-    if manifest.descriptor.last_access_time.is_some() {
-        time_flags |= 2;
-    }
-    if manifest.descriptor.last_write_time.is_some() {
-        time_flags |= 4;
-    }
-    response.push(time_flags);
-    response.extend_from_slice(&filetime_bits(manifest.descriptor.creation_time).to_be_bytes());
-    response.extend_from_slice(&filetime_bits(manifest.descriptor.last_access_time).to_be_bytes());
-    response.extend_from_slice(&filetime_bits(manifest.descriptor.last_write_time).to_be_bytes());
     response.extend_from_slice(
         &u64::try_from(manifest.ttl.as_millis())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
-    let name = manifest.descriptor.file_name.as_bytes();
-    let name_length = u16::try_from(name.len()).map_err(|_| ResponseStatus::Internal)?;
-    response.extend_from_slice(&name_length.to_be_bytes());
-    response.extend_from_slice(name);
+    response.extend_from_slice(
+        &u32::try_from(manifest.entries.len())
+            .map_err(|_| ResponseStatus::Internal)?
+            .to_be_bytes(),
+    );
+    for entry in manifest.entries.iter() {
+        response.extend_from_slice(&entry.file_id.0);
+        response.extend_from_slice(&entry.descriptor.size.to_be_bytes());
+        response.extend_from_slice(&entry.descriptor.attributes.to_be_bytes());
+        let mut time_flags = 0_u8;
+        if entry.descriptor.creation_time.is_some() {
+            time_flags |= 1;
+        }
+        if entry.descriptor.last_access_time.is_some() {
+            time_flags |= 2;
+        }
+        if entry.descriptor.last_write_time.is_some() {
+            time_flags |= 4;
+        }
+        response.push(time_flags);
+        response.extend_from_slice(&filetime_bits(entry.descriptor.creation_time).to_be_bytes());
+        response.extend_from_slice(&filetime_bits(entry.descriptor.last_access_time).to_be_bytes());
+        response.extend_from_slice(&filetime_bits(entry.descriptor.last_write_time).to_be_bytes());
+        let name = entry.descriptor.file_name.as_bytes();
+        let name_length = u16::try_from(name.len()).map_err(|_| ResponseStatus::Internal)?;
+        response.extend_from_slice(&name_length.to_be_bytes());
+        response.extend_from_slice(name);
+        if response.len() > MAX_SECURE_MANIFEST_BYTES {
+            return Err(ResponseStatus::Internal);
+        }
+    }
     Ok(response)
 }
 
@@ -1002,15 +1092,16 @@ fn encode_begin_response(
     peer: CertificateFingerprint,
     payload: &[u8],
 ) -> WireResult<Vec<u8>> {
-    if payload.len() != 48 {
+    if payload.len() != 64 {
         return Err(ResponseStatus::Invalid);
     }
     let offer_id = ProtocolId(array_at(payload, 0)?);
-    let nonce = array_at(payload, 16)?;
+    let file_id = ProtocolId(array_at(payload, 16)?);
+    let nonce = array_at(payload, 32)?;
     if nonce.iter().all(|byte| *byte == 0) {
         return Err(ResponseStatus::Invalid);
     }
-    let credentials = state.begin_transfer(peer, offer_id, nonce)?;
+    let credentials = state.begin_transfer(peer, offer_id, file_id, nonce)?;
     let mut response = vec![ResponseStatus::Ok.encode()];
     response.extend_from_slice(&credentials.offer_id.0);
     response.extend_from_slice(&credentials.file_id.0);
@@ -1183,43 +1274,107 @@ impl SecureOfferClient {
     /// Returns an error for TLS, I/O, protocol, expiry, or unsafe file-name failures.
     pub fn fetch_manifest(&self) -> io::Result<OfferManifest> {
         let response = self.command(Opcode::GetOffer, Vec::new())?;
-        require_ok(&response)?;
-        if response.len() < 80 {
+        Self::decode_manifest_response(&response)
+    }
+
+    fn decode_manifest_response(response: &[u8]) -> io::Result<OfferManifest> {
+        require_ok(response)?;
+        if response.len() < MANIFEST_HEADER_LEN {
             return Err(invalid_data("truncated offer manifest"));
         }
-        let offer_id = ProtocolId(array_at_io(&response, 1)?);
-        let file_id = ProtocolId(array_at_io(&response, 17)?);
-        let size = u64::from_be_bytes(array_at_io(&response, 33)?);
-        let attributes = u32::from_be_bytes(array_at_io(&response, 41)?);
-        let time_flags = response[45];
-        let creation = u64::from_be_bytes(array_at_io(&response, 46)?);
-        let access = u64::from_be_bytes(array_at_io(&response, 54)?);
-        let write = u64::from_be_bytes(array_at_io(&response, 62)?);
-        let ttl_millis = u64::from_be_bytes(array_at_io(&response, 70)?);
-        let name_length = usize::from(u16::from_be_bytes(array_at_io(&response, 78)?));
-        if response.len() != 80 + name_length {
-            return Err(invalid_data("invalid offer file name length"));
+        let offer_id = ProtocolId(array_at_io(response, 1)?);
+        let ttl_millis = u64::from_be_bytes(array_at_io(response, 17)?);
+        if ttl_millis == 0 {
+            return Err(invalid_data("expired offer manifest"));
         }
-        let file_name = std::str::from_utf8(&response[80..]).map_err(invalid_crypto)?;
-        validate_virtual_file_name(file_name).map_err(invalid_windows)?;
+        let item_count = usize::try_from(u32::from_be_bytes(array_at_io(response, 25)?))
+            .map_err(invalid_crypto)?;
+        if item_count == 0 || item_count > MAX_VIRTUAL_ITEMS {
+            return Err(invalid_data("invalid offer item count"));
+        }
+        let minimum = MANIFEST_HEADER_LEN
+            .checked_add(
+                item_count
+                    .checked_mul(MANIFEST_ENTRY_FIXED_LEN)
+                    .ok_or_else(|| invalid_data("offer manifest length overflow"))?,
+            )
+            .ok_or_else(|| invalid_data("offer manifest length overflow"))?;
+        if response.len() < minimum || response.len() > MAX_SECURE_MANIFEST_BYTES {
+            return Err(invalid_data("invalid offer manifest length"));
+        }
+        let mut cursor = MANIFEST_HEADER_LEN;
+        let mut entries = Vec::with_capacity(item_count);
+        let mut identifiers = std::collections::HashSet::with_capacity(item_count);
+        for _ in 0..item_count {
+            let file_id = ProtocolId(array_at_io(response, cursor)?);
+            cursor += 16;
+            if !identifiers.insert(file_id) {
+                return Err(invalid_data("duplicate offer file identifier"));
+            }
+            let size = u64::from_be_bytes(array_at_io(response, cursor)?);
+            cursor += 8;
+            let attributes = u32::from_be_bytes(array_at_io(response, cursor)?);
+            cursor += 4;
+            let time_flags = *response
+                .get(cursor)
+                .ok_or_else(|| invalid_data("truncated offer time flags"))?;
+            cursor += 1;
+            if time_flags & !0b111 != 0 {
+                return Err(invalid_data("invalid offer time flags"));
+            }
+            let creation = u64::from_be_bytes(array_at_io(response, cursor)?);
+            cursor += 8;
+            let access = u64::from_be_bytes(array_at_io(response, cursor)?);
+            cursor += 8;
+            let write = u64::from_be_bytes(array_at_io(response, cursor)?);
+            cursor += 8;
+            let name_length = usize::from(u16::from_be_bytes(array_at_io(response, cursor)?));
+            cursor += 2;
+            let name_end = cursor
+                .checked_add(name_length)
+                .ok_or_else(|| invalid_data("offer file name length overflow"))?;
+            let name = response
+                .get(cursor..name_end)
+                .ok_or_else(|| invalid_data("truncated offer file name"))?;
+            let file_name = std::str::from_utf8(name).map_err(invalid_crypto)?;
+            entries.push(OfferManifestEntry {
+                file_id,
+                descriptor: VirtualFileDescriptor {
+                    file_name: Arc::from(file_name),
+                    size,
+                    attributes,
+                    creation_time: (time_flags & 1 != 0).then(|| filetime_from_bits(creation)),
+                    last_access_time: (time_flags & 2 != 0).then(|| filetime_from_bits(access)),
+                    last_write_time: (time_flags & 4 != 0).then(|| filetime_from_bits(write)),
+                },
+            });
+            cursor = name_end;
+        }
+        if cursor != response.len() {
+            return Err(invalid_data("trailing offer manifest bytes"));
+        }
+        validate_virtual_descriptor_tree(
+            &entries
+                .iter()
+                .map(|entry| entry.descriptor.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(invalid_windows)?;
         Ok(OfferManifest {
             offer_id,
-            file_id,
-            descriptor: VirtualFileDescriptor {
-                file_name: Arc::from(file_name),
-                size,
-                attributes,
-                creation_time: (time_flags & 1 != 0).then(|| filetime_from_bits(creation)),
-                last_access_time: (time_flags & 2 != 0).then(|| filetime_from_bits(access)),
-                last_write_time: (time_flags & 4 != 0).then(|| filetime_from_bits(write)),
-            },
+            entries: Arc::from(entries),
             ttl: Duration::from_millis(ttl_millis),
         })
     }
 
-    fn begin_transfer(&self, manifest: &OfferManifest) -> io::Result<TransferCredentials> {
-        let mut payload = Vec::with_capacity(48);
+    fn begin_transfer(
+        &self,
+        manifest: &OfferManifest,
+        entry: &OfferManifestEntry,
+    ) -> io::Result<TransferCredentials> {
+        let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(&manifest.offer_id.0);
+        payload.extend_from_slice(&entry.file_id.0);
         payload.extend_from_slice(&random_bytes::<32>()?);
         let response = self.command(Opcode::BeginTransfer, payload)?;
         require_ok(&response)?;
@@ -1234,7 +1389,7 @@ impl SecureOfferClient {
             server_nonce: array_at_io(&response, 81)?,
             expires_at_millis: u64::from_be_bytes(array_at_io(&response, 113)?),
         };
-        if credentials.offer_id != manifest.offer_id || credentials.file_id != manifest.file_id {
+        if credentials.offer_id != manifest.offer_id || credentials.file_id != entry.file_id {
             return Err(invalid_data("BeginTransfer identifiers do not match offer"));
         }
         Ok(credentials)
@@ -1369,24 +1524,67 @@ impl SecureOfferClient {
 pub struct SecureRemoteSource {
     client: SecureOfferClient,
     manifest: OfferManifest,
+    entry: OfferManifestEntry,
     transfer: Mutex<Option<TransferCredentials>>,
     next_control_sequence: AtomicU64,
     completion_sent: AtomicBool,
     read_calls: AtomicU64,
     bytes_read: AtomicU64,
+    group_paused: Arc<AtomicBool>,
+    group_cancelled: Arc<AtomicBool>,
 }
 
 impl SecureRemoteSource {
     #[must_use]
+    /// Creates a source for the first ordinary file in a validated manifest.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the manifest contains only directory descriptors. Callers handling arbitrary
+    /// trees must select an ordinary entry and use [`Self::new_for_entry`].
     pub fn new(client: SecureOfferClient, manifest: OfferManifest) -> Self {
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| !entry.descriptor.is_directory())
+            .cloned()
+            .expect("secure manifest must contain a streamable file");
+        Self::new_for_entry(client, manifest, entry)
+    }
+
+    #[must_use]
+    pub fn new_for_entry(
+        client: SecureOfferClient,
+        manifest: OfferManifest,
+        entry: OfferManifestEntry,
+    ) -> Self {
+        Self::new_for_entry_in_group(
+            client,
+            manifest,
+            entry,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn new_for_entry_in_group(
+        client: SecureOfferClient,
+        manifest: OfferManifest,
+        entry: OfferManifestEntry,
+        group_paused: Arc<AtomicBool>,
+        group_cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             client,
             manifest,
+            entry,
             transfer: Mutex::new(None),
             next_control_sequence: AtomicU64::new(1),
             completion_sent: AtomicBool::new(false),
             read_calls: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
+            group_paused,
+            group_cancelled,
         }
     }
 
@@ -1398,8 +1596,21 @@ impl SecureRemoteSource {
         if let Some(credentials) = *transfer {
             return Ok(credentials);
         }
-        let credentials = self.client.begin_transfer(&self.manifest)?;
+        let credentials = self.client.begin_transfer(&self.manifest, &self.entry)?;
         *transfer = Some(credentials);
+        drop(transfer);
+        if self.group_cancelled.load(Ordering::Acquire) {
+            let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
+            let _ = self.client.control(credentials, sequence, Opcode::Cancel);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer group was cancelled",
+            ));
+        }
+        if self.group_paused.load(Ordering::Acquire) {
+            let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
+            self.client.control(credentials, sequence, Opcode::Pause)?;
+        }
         Ok(credentials)
     }
 
@@ -1484,15 +1695,64 @@ impl SecureRemoteSource {
 #[derive(Default)]
 pub struct RemoteTransferRegistry {
     sources: Mutex<Vec<Arc<SecureRemoteSource>>>,
+    group_paused: Arc<AtomicBool>,
+    group_cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferGroupStatus {
+    pub state: RemoteTransferState,
+    pub started_transfers: usize,
+    pub unique_bytes: u64,
+    pub read_calls: u64,
+    pub bytes_read: u64,
 }
 
 impl RemoteTransferRegistry {
+    /// Creates and remembers a source for the first ordinary file in a validated manifest.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the manifest contains only directory descriptors. Tree-aware callers must use
+    /// [`Self::create_source_for_entry`].
     pub fn create_source(
         &self,
         client: SecureOfferClient,
         manifest: OfferManifest,
     ) -> Arc<SecureRemoteSource> {
-        let source = Arc::new(SecureRemoteSource::new(client, manifest));
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| !entry.descriptor.is_directory())
+            .cloned()
+            .expect("secure manifest must contain a streamable file");
+        let source = Arc::new(SecureRemoteSource::new_for_entry_in_group(
+            client,
+            manifest,
+            entry,
+            Arc::clone(&self.group_paused),
+            Arc::clone(&self.group_cancelled),
+        ));
+        self.remember_source(source)
+    }
+
+    pub fn create_source_for_entry(
+        &self,
+        client: SecureOfferClient,
+        manifest: OfferManifest,
+        entry: OfferManifestEntry,
+    ) -> Arc<SecureRemoteSource> {
+        let source = Arc::new(SecureRemoteSource::new_for_entry_in_group(
+            client,
+            manifest,
+            entry,
+            Arc::clone(&self.group_paused),
+            Arc::clone(&self.group_cancelled),
+        ));
+        self.remember_source(source)
+    }
+
+    fn remember_source(&self, source: Arc<SecureRemoteSource>) -> Arc<SecureRemoteSource> {
         if let Ok(mut sources) = self.sources.lock() {
             sources.push(Arc::clone(&source));
             if sources.len() > MAX_TRANSFERS {
@@ -1521,6 +1781,110 @@ impl RemoteTransferRegistry {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no transfer has started"))
     }
 
+    fn started_sources(&self) -> io::Result<Vec<Arc<SecureRemoteSource>>> {
+        let sources = self
+            .sources
+            .lock()
+            .map_err(|_| io::Error::other("remote source registry lock poisoned"))?;
+        let started = sources
+            .iter()
+            .filter(|source| source.has_started())
+            .cloned()
+            .collect::<Vec<_>>();
+        if started.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no transfer has started",
+            ));
+        }
+        Ok(started)
+    }
+
+    /// Pauses every file stream that belongs to the current Explorer paste operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before any stream starts or when a TLS/protocol control request fails.
+    pub fn pause_all(&self) -> io::Result<TransferGroupStatus> {
+        let sources = self.started_sources()?;
+        self.group_paused.store(true, Ordering::Release);
+        for source in &sources {
+            source.pause()?;
+        }
+        Self::aggregate(&sources)
+    }
+
+    /// Resumes every paused file stream in the current Explorer paste operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before any stream starts or when a TLS/protocol control request fails.
+    pub fn resume_all(&self) -> io::Result<TransferGroupStatus> {
+        let sources = self.started_sources()?;
+        self.group_paused.store(false, Ordering::Release);
+        for source in &sources {
+            source.resume()?;
+        }
+        Self::aggregate(&sources)
+    }
+
+    /// Irreversibly cancels all current and not-yet-opened streams in this paste operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before any stream starts or when a TLS/protocol control request fails.
+    pub fn cancel_all(&self) -> io::Result<TransferGroupStatus> {
+        let sources = self.started_sources()?;
+        self.group_cancelled.store(true, Ordering::Release);
+        self.group_paused.store(false, Ordering::Release);
+        for source in &sources {
+            source.cancel()?;
+        }
+        Self::aggregate(&sources)
+    }
+
+    /// Returns aggregate progress for all file streams that have started in this paste operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before any stream starts or when a TLS/protocol status request fails.
+    pub fn status_all(&self) -> io::Result<TransferGroupStatus> {
+        let sources = self.started_sources()?;
+        Self::aggregate(&sources)
+    }
+
+    fn aggregate(sources: &[Arc<SecureRemoteSource>]) -> io::Result<TransferGroupStatus> {
+        let mut state = RemoteTransferState::Completed;
+        let mut unique_bytes = 0_u64;
+        let mut read_calls = 0_u64;
+        let mut bytes_read = 0_u64;
+        for source in sources {
+            let status = source.status()?;
+            state = match (state, status.state) {
+                (_, RemoteTransferState::Cancelled) | (RemoteTransferState::Cancelled, _) => {
+                    RemoteTransferState::Cancelled
+                }
+                (_, RemoteTransferState::Running) | (RemoteTransferState::Running, _) => {
+                    RemoteTransferState::Running
+                }
+                (_, RemoteTransferState::Paused) | (RemoteTransferState::Paused, _) => {
+                    RemoteTransferState::Paused
+                }
+                _ => RemoteTransferState::Completed,
+            };
+            unique_bytes = unique_bytes.saturating_add(status.unique_bytes);
+            read_calls = read_calls.saturating_add(source.read_calls());
+            bytes_read = bytes_read.saturating_add(source.bytes_read());
+        }
+        Ok(TransferGroupStatus {
+            state,
+            started_transfers: sources.len(),
+            unique_bytes,
+            read_calls,
+            bytes_read,
+        })
+    }
+
     #[must_use]
     pub fn live_sources(&self) -> usize {
         self.sources
@@ -1532,12 +1896,21 @@ impl RemoteTransferRegistry {
 
 impl ReadAtSource for SecureRemoteSource {
     fn len(&self) -> u64 {
-        self.manifest.descriptor.size
+        self.entry.descriptor.size
     }
 
     fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize> {
         if destination.is_empty() {
             return Ok(0);
+        }
+        loop {
+            if self.group_cancelled.load(Ordering::Acquire) {
+                return Err(Error::from_hresult(HRESULT::from_win32(ERROR_CANCELLED.0)));
+            }
+            if !self.group_paused.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         let requested = destination.len().min(MAX_SECURE_RANGE_BYTES);
@@ -1556,11 +1929,11 @@ impl ReadAtSource for SecureRemoteSource {
             }
             break bytes;
         };
-        if bytes.is_empty() && offset < self.manifest.descriptor.size {
+        if bytes.is_empty() && offset < self.entry.descriptor.size {
             return Err(Error::from_hresult(HRESULT::from_win32(ERROR_READ_FAULT.0)));
         }
         if bytes.is_empty()
-            && offset >= self.manifest.descriptor.size
+            && offset >= self.entry.descriptor.size
             && !self.completion_sent.swap(true, Ordering::AcqRel)
         {
             let sequence = self.next_control_sequence.fetch_add(1, Ordering::Relaxed);
@@ -1811,10 +2184,12 @@ mod tests {
 
     use rcgen::CertifiedKey;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 
     use crate::security::{CertificateFingerprint, TlsIdentity};
 
     use super::*;
+    use crate::clipboard::source::MemorySource;
     use crate::clipboard::transfer::generated_byte;
 
     struct TestPeers {
@@ -1987,8 +2362,11 @@ mod tests {
     fn offer_metadata_is_authenticated_and_content_is_deferred_until_read() {
         let (server, client, _) = start_generated(1024 * 1024);
         let manifest = client.fetch_manifest().unwrap();
-        assert_eq!(&*manifest.descriptor.file_name, "Remote-Secure-Test.bin");
-        assert_eq!(manifest.descriptor.size, 1024 * 1024);
+        assert_eq!(
+            &*manifest.entries[0].descriptor.file_name,
+            "Remote-Secure-Test.bin"
+        );
+        assert_eq!(manifest.entries[0].descriptor.size, 1024 * 1024);
         assert_eq!(server.metrics().begun_transfers, 0);
         assert_eq!(server.metrics().read_requests, 0);
 
@@ -2003,6 +2381,150 @@ mod tests {
         assert_eq!(server.metrics().begun_transfers, 1);
         assert_eq!(server.metrics().read_requests, 1);
         assert_eq!(server.metrics().unique_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn secure_tree_manifest_defers_content_and_supports_independent_out_of_order_streams() {
+        let peers = peers();
+        let alpha: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"alpha"[..]));
+        let ferry: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"ferry"[..]));
+        let offered = SecureOfferedFile::new_tree(
+            vec![
+                (
+                    VirtualFileDescriptor {
+                        file_name: Arc::from("资料-🚢"),
+                        size: 0,
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        creation_time: None,
+                        last_access_time: None,
+                        last_write_time: None,
+                    },
+                    None,
+                ),
+                (
+                    VirtualFileDescriptor::basic(Arc::from("资料-🚢\\alpha.txt"), 5),
+                    Some(alpha),
+                ),
+                (
+                    VirtualFileDescriptor {
+                        file_name: Arc::from("资料-🚢\\空目录"),
+                        size: 0,
+                        attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        creation_time: None,
+                        last_access_time: None,
+                        last_write_time: None,
+                    },
+                    None,
+                ),
+                (
+                    VirtualFileDescriptor::basic(Arc::from("emoji-🚢.bin"), 5),
+                    Some(ferry),
+                ),
+            ],
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.client);
+
+        let manifest = client.fetch_manifest().unwrap();
+        assert_eq!(manifest.entries.len(), 4);
+        assert_eq!(server.metrics().begun_transfers, 0);
+        assert_eq!(server.metrics().read_requests, 0);
+        let Err(directory_error) = client.begin_transfer(&manifest, &manifest.entries[0]) else {
+            panic!("directory unexpectedly opened a content transfer");
+        };
+        assert_eq!(directory_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let registry = RemoteTransferRegistry::default();
+        let alpha_source = registry.create_source_for_entry(
+            client.clone(),
+            manifest.clone(),
+            manifest.entries[1].clone(),
+        );
+        let ferry_source =
+            registry.create_source_for_entry(client, manifest.clone(), manifest.entries[3].clone());
+        let ferry_thread = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 5];
+            assert_eq!(ferry_source.read_at(0, &mut bytes).unwrap(), 5);
+            bytes
+        });
+        let alpha_thread = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 5];
+            assert_eq!(alpha_source.read_at(0, &mut bytes).unwrap(), 5);
+            bytes
+        });
+        assert_eq!(&ferry_thread.join().unwrap(), b"ferry");
+        assert_eq!(&alpha_thread.join().unwrap(), b"alpha");
+
+        let status = registry.status_all().unwrap();
+        assert_eq!(status.started_transfers, 2);
+        assert_eq!(status.unique_bytes, 10);
+        assert_eq!(status.read_calls, 2);
+        assert_eq!(status.bytes_read, 10);
+        assert_eq!(server.metrics().begun_transfers, 2);
+        assert_eq!(server.metrics().read_requests, 2);
+        assert_eq!(server.metrics().unique_bytes, 10);
+    }
+
+    #[test]
+    fn group_pause_resume_and_cancel_apply_to_every_started_file_stream() {
+        let peers = peers();
+        let first: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"first"[..]));
+        let second: Arc<dyn ReadAtSource> = Arc::new(MemorySource::new(&b"second"[..]));
+        let offered = SecureOfferedFile::new_tree(
+            vec![
+                (
+                    VirtualFileDescriptor::basic(Arc::from("first.txt"), 5),
+                    Some(first),
+                ),
+                (
+                    VirtualFileDescriptor::basic(Arc::from("second.txt"), 6),
+                    Some(second),
+                ),
+            ],
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server,
+            offered,
+            Duration::from_mins(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.client);
+        let manifest = client.fetch_manifest().unwrap();
+        let registry = RemoteTransferRegistry::default();
+        let first = registry.create_source_for_entry(
+            client.clone(),
+            manifest.clone(),
+            manifest.entries[0].clone(),
+        );
+        let second =
+            registry.create_source_for_entry(client, manifest.clone(), manifest.entries[1].clone());
+        let mut byte = [0_u8; 1];
+        first.read_at(0, &mut byte).unwrap();
+        second.read_at(0, &mut byte).unwrap();
+
+        let paused = registry.pause_all().unwrap();
+        assert_eq!(paused.state, RemoteTransferState::Paused);
+        assert_eq!(paused.started_transfers, 2);
+        let running = registry.resume_all().unwrap();
+        assert_eq!(running.state, RemoteTransferState::Running);
+        let cancelled = registry.cancel_all().unwrap();
+        assert_eq!(cancelled.state, RemoteTransferState::Cancelled);
+        assert_eq!(server.metrics().cancelled_transfers, 2);
+        let error = first.read_at(1, &mut byte).unwrap_err();
+        assert_eq!(error.code(), HRESULT::from_win32(ERROR_CANCELLED.0));
     }
 
     #[test]
@@ -2116,8 +2638,9 @@ mod tests {
     fn repeated_begin_nonce_is_rejected_as_a_replay() {
         let (server, client, _) = start_generated(4096);
         let manifest = client.fetch_manifest().unwrap();
-        let mut payload = Vec::with_capacity(48);
+        let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(&manifest.offer_id.0);
+        payload.extend_from_slice(&manifest.entries[0].file_id.0);
         payload.extend_from_slice(&[0xA5; 32]);
 
         let first = client
@@ -2274,7 +2797,12 @@ mod tests {
         .unwrap();
         let authorized = SecureOfferClient::new(server.address(), peers.authorized.clone());
         let other = SecureOfferClient::new(server.address(), peers.other.clone());
-        assert_eq!(authorized.fetch_manifest().unwrap().descriptor.size, 4096);
+        assert_eq!(
+            authorized.fetch_manifest().unwrap().entries[0]
+                .descriptor
+                .size,
+            4096
+        );
         assert!(other.fetch_manifest().is_err());
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2425,7 +2953,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(server.metrics().protocol_errors >= 1);
-        assert_eq!(client.fetch_manifest().unwrap().descriptor.size, 4096);
+        assert_eq!(
+            client.fetch_manifest().unwrap().entries[0].descriptor.size,
+            4096
+        );
+    }
+
+    #[test]
+    fn receiver_manifest_decoder_rejects_malicious_metadata_before_exposing_it_to_shell() {
+        let (server, _client, _) = start_generated(4096);
+        let valid = encode_manifest_response(&server.state, &[]).unwrap();
+        let decoded = SecureOfferClient::decode_manifest_response(&valid).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+
+        let mut corpus = Vec::new();
+        let mut zero_ttl = valid.clone();
+        zero_ttl[17..25].fill(0);
+        corpus.push(zero_ttl);
+
+        let mut zero_items = valid.clone();
+        zero_items[25..29].fill(0);
+        corpus.push(zero_items);
+
+        let time_flags_offset = MANIFEST_HEADER_LEN + 16 + 8 + 4;
+        let mut invalid_time_flags = valid.clone();
+        invalid_time_flags[time_flags_offset] = 0x80;
+        corpus.push(invalid_time_flags);
+
+        let name_length_offset = time_flags_offset + 1 + 24;
+        let name_offset = name_length_offset + 2;
+        let mut trailing_dot_path = valid.clone();
+        *trailing_dot_path.last_mut().unwrap() = b'.';
+        corpus.push(trailing_dot_path);
+
+        let mut truncated_name = valid.clone();
+        let name_length = u16::from_be_bytes(
+            truncated_name[name_length_offset..name_offset]
+                .try_into()
+                .unwrap(),
+        );
+        truncated_name[name_length_offset..name_offset]
+            .copy_from_slice(&name_length.saturating_add(1).to_be_bytes());
+        corpus.push(truncated_name);
+
+        let mut trailing_bytes = valid.clone();
+        trailing_bytes.push(0);
+        corpus.push(trailing_bytes);
+
+        let mut oversized = valid;
+        oversized.resize(MAX_SECURE_MANIFEST_BYTES + 1, 0);
+        corpus.push(oversized);
+
+        for malformed in corpus {
+            assert!(SecureOfferClient::decode_manifest_response(&malformed).is_err());
+        }
     }
 
     #[test]
