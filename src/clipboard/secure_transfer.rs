@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -21,8 +21,8 @@ use super::transfer::{GeneratedSource, TransferControl};
 const MAGIC: [u8; 4] = *b"CFS4";
 const PROTOCOL_VERSION: u16 = 1;
 const FRAME_HEADER_LEN: usize = 20;
-const MAX_FRAME_PAYLOAD: usize = 128 * 1024;
-pub const MAX_SECURE_RANGE_BYTES: usize = 64 * 1024;
+pub const MAX_SECURE_RANGE_BYTES: usize = 256 * 1024;
+const MAX_FRAME_PAYLOAD: usize = MAX_SECURE_RANGE_BYTES + 256;
 const MAX_TRANSFERS: usize = 64;
 const MAX_BEGIN_NONCES: usize = 4_096;
 const MAX_TRACKED_RANGES: usize = 4_096;
@@ -332,6 +332,10 @@ struct ServerState {
 }
 
 impl ServerState {
+    fn connection_idle_timeout(&self) -> Duration {
+        self.transfer_ttl.max(self.request_timeout)
+    }
+
     fn begin_transfer(
         &self,
         offer_id: ProtocolId,
@@ -679,9 +683,13 @@ fn secure_accept_loop(
                         let _guard = WorkerCountGuard(worker_count);
                         match worker_tls.accept(socket) {
                             Ok(mut stream) => {
-                                if let Err(error) =
-                                    handle_secure_connection(&mut stream, &worker_state)
-                                {
+                                let result = stream
+                                    .sock
+                                    .set_read_timeout(Some(worker_state.connection_idle_timeout()))
+                                    .and_then(|()| {
+                                        handle_secure_connection(&mut stream, &worker_state)
+                                    });
+                                if let Err(error) = result {
                                     eprintln!("SECURE connection_error={error}");
                                     worker_state
                                         .metrics
@@ -746,17 +754,21 @@ fn handle_secure_connection(
         },
     )?;
 
-    let request = read_frame(stream)?;
-    let opcode = Opcode::try_from(request.opcode)?;
-    let response = dispatch_request(state, opcode, &request.payload);
-    write_frame(
-        stream,
-        Frame {
-            opcode: response_opcode(opcode),
-            request_id: request.request_id,
-            payload: response,
-        },
-    )
+    loop {
+        let Some(request) = read_frame_optional(stream)? else {
+            return Ok(());
+        };
+        let opcode = Opcode::try_from(request.opcode)?;
+        let response = dispatch_request(state, opcode, &request.payload);
+        write_frame(
+            stream,
+            Frame {
+                opcode: response_opcode(opcode),
+                request_id: request.request_id,
+                payload: response,
+            },
+        )?;
+    }
 }
 
 fn dispatch_request(state: &ServerState, opcode: Opcode, payload: &[u8]) -> Vec<u8> {
@@ -941,6 +953,28 @@ pub struct SecureOfferClient {
     address: SocketAddr,
     tls: PinnedTlsClient,
     next_request_id: Arc<AtomicU64>,
+    connections: Arc<SecureCommandConnections>,
+}
+
+#[derive(Default)]
+struct SecureCommandConnections {
+    control: Mutex<Option<SecureCommandConnection>>,
+    data: Mutex<Option<SecureCommandConnection>>,
+}
+
+struct SecureCommandConnection {
+    stream: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    close_gracefully: bool,
+}
+
+impl Drop for SecureCommandConnection {
+    fn drop(&mut self) {
+        if self.close_gracefully {
+            self.stream.conn.send_close_notify();
+            let _ = io::Write::flush(&mut self.stream);
+        }
+        let _ = self.stream.sock.shutdown(Shutdown::Both);
+    }
 }
 
 impl SecureOfferClient {
@@ -950,6 +984,7 @@ impl SecureOfferClient {
             address,
             tls,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            connections: Arc::new(SecureCommandConnections::default()),
         }
     }
 
@@ -1064,6 +1099,36 @@ impl SecureOfferClient {
     }
 
     fn command(&self, opcode: Opcode, payload: Vec<u8>) -> io::Result<Vec<u8>> {
+        let connection_slot = if matches!(opcode, Opcode::ReadRange) {
+            &self.connections.data
+        } else {
+            &self.connections.control
+        };
+        let mut connection = connection_slot
+            .lock()
+            .map_err(|_| io::Error::other("secure client connection lock poisoned"))?;
+        if connection.is_none() {
+            *connection = Some(self.connect()?);
+        }
+
+        let result = Self::exchange(
+            &mut connection
+                .as_mut()
+                .expect("secure connection was initialized")
+                .stream,
+            &self.next_request_id,
+            opcode,
+            payload,
+        );
+        if result.is_err()
+            && let Some(mut failed) = connection.take()
+        {
+            failed.close_gracefully = false;
+        }
+        result
+    }
+
+    fn connect(&self) -> io::Result<SecureCommandConnection> {
         let mut stream = self.tls.connect(self.address)?;
         let hello_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let mut hello = Vec::with_capacity(33);
@@ -1084,17 +1149,28 @@ impl SecureOfferClient {
         {
             return Err(invalid_data("invalid secure HelloAck"));
         }
+        Ok(SecureCommandConnection {
+            stream,
+            close_gracefully: true,
+        })
+    }
 
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+    fn exchange(
+        stream: &mut (impl io::Read + io::Write),
+        next_request_id: &AtomicU64,
+        opcode: Opcode,
+        payload: Vec<u8>,
+    ) -> io::Result<Vec<u8>> {
+        let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
         write_frame(
-            &mut stream,
+            stream,
             Frame {
                 opcode: opcode as u16,
                 request_id,
                 payload,
             },
         )?;
-        let response = read_frame(&mut stream)?;
+        let response = read_frame(stream)?;
         if response.opcode != response_opcode(opcode) || response.request_id != request_id {
             return Err(invalid_data("secure response does not match request"));
         }
@@ -1418,8 +1494,16 @@ fn write_frame(stream: &mut impl io::Write, frame: Frame) -> io::Result<()> {
 }
 
 fn read_frame(stream: &mut impl io::Read) -> io::Result<Frame> {
+    read_frame_optional(stream)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "secure connection closed"))
+}
+
+fn read_frame_optional(stream: &mut impl io::Read) -> io::Result<Option<Frame>> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
-    stream.read_exact(&mut header)?;
+    if io::Read::read(stream, &mut header[..1])? == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut header[1..])?;
     if header[..4] != MAGIC || u16::from_be_bytes(array_at_io(&header, 4)?) != PROTOCOL_VERSION {
         return Err(invalid_data("invalid secure frame magic or version"));
     }
@@ -1432,11 +1516,11 @@ fn read_frame(stream: &mut impl io::Read) -> io::Result<Frame> {
     }
     let mut payload = vec![0_u8; payload_length];
     stream.read_exact(&mut payload)?;
-    Ok(Frame {
+    Ok(Some(Frame {
         opcode,
         request_id,
         payload,
-    })
+    }))
 }
 
 fn response_opcode(opcode: Opcode) -> u16 {
@@ -1562,10 +1646,13 @@ mod tests {
     }
 
     fn peers() -> TestPeers {
+        peers_with_timeout(Duration::from_secs(3))
+    }
+
+    fn peers_with_timeout(timeout: Duration) -> TestPeers {
         let (server_identity, server_certificate) = identity();
         let (client_identity, client_certificate) = identity();
         let (other_identity, _) = identity();
-        let timeout = Duration::from_secs(3);
         TestPeers {
             server: PinnedTlsServer::new(
                 &server_identity,
@@ -1639,6 +1726,76 @@ mod tests {
         assert_eq!(server.metrics().begun_transfers, 1);
         assert_eq!(server.metrics().read_requests, 1);
         assert_eq!(server.metrics().unique_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn sequential_commands_reuse_bounded_tls_connections() {
+        let length = 2_u64 * 1024 * 1024;
+        let (server, client, _) = start_generated(length);
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client, manifest);
+        let mut bytes = vec![0_u8; MAX_SECURE_RANGE_BYTES];
+
+        for offset in (0..length).step_by(MAX_SECURE_RANGE_BYTES) {
+            assert_eq!(
+                source.read_at(offset, &mut bytes).unwrap(),
+                MAX_SECURE_RANGE_BYTES
+            );
+        }
+        assert_eq!(source.status().unwrap().unique_bytes, length);
+        assert_eq!(source.pause().unwrap().state, RemoteTransferState::Paused);
+        assert_eq!(source.resume().unwrap().state, RemoteTransferState::Running);
+        assert_eq!(
+            source.complete().unwrap().state,
+            RemoteTransferState::Completed
+        );
+
+        let metrics = server.metrics();
+        assert_eq!(metrics.accepted_connections, 2);
+        assert_eq!(
+            metrics.read_requests,
+            length / MAX_SECURE_RANGE_BYTES as u64
+        );
+        assert_eq!(metrics.protocol_errors, 0);
+
+        drop(source);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.workers.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.workers.load(Ordering::Acquire), 0);
+        assert_eq!(server.metrics().protocol_errors, 0);
+    }
+
+    #[test]
+    fn persistent_control_connection_outlives_the_tls_io_timeout() {
+        let peers = peers_with_timeout(Duration::from_millis(250));
+        let offered = SecureOfferedFile::generated(
+            Arc::from("Remote-Secure-Test.bin"),
+            4096,
+            Duration::from_mins(1),
+        )
+        .unwrap();
+        let server = SecureOfferServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            peers.server,
+            offered,
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        let client = SecureOfferClient::new(server.address(), peers.client);
+
+        let manifest = client.fetch_manifest().unwrap();
+        let source = SecureRemoteSource::new(client, manifest);
+        let mut bytes = [0_u8; 256];
+        source.read_at(0, &mut bytes).unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        assert_eq!(source.status().unwrap().unique_bytes, 256);
+        source.read_at(256, &mut bytes).unwrap();
+
+        assert_eq!(server.metrics().accepted_connections, 2);
+        assert_eq!(server.metrics().protocol_errors, 0);
     }
 
     #[test]
