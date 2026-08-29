@@ -73,12 +73,12 @@ impl Hello {
         Ok(encoded)
     }
 
-    fn write_to(&self, stream: &mut TcpStream) -> io::Result<()> {
+    fn write_to(&self, stream: &mut impl io::Write) -> io::Result<()> {
         stream.write_all(&self.encode()?)?;
         stream.flush()
     }
 
-    fn read_from(stream: &mut TcpStream, expected_role: Role) -> io::Result<Self> {
+    fn read_from(stream: &mut impl io::Read, expected_role: Role) -> io::Result<Self> {
         let mut header = [0_u8; HELLO_HEADER_LENGTH];
         stream.read_exact(&mut header)?;
         if &header[..8] != HELLO_MAGIC {
@@ -581,6 +581,66 @@ mod tests {
     }
 
     #[test]
+    fn active_terminating_mitm_produces_different_codes_and_no_trust_when_rejected() {
+        let listener_directory = TestDirectory::new("mitm-listener");
+        let connector_directory = TestDirectory::new("mitm-connector");
+        let attacker_directory = TestDirectory::new("mitm-attacker");
+        let listener_store = DeviceStore::new(&listener_directory.0);
+        let connector_store = DeviceStore::new(&connector_directory.0);
+        let attacker_store = DeviceStore::new(&attacker_directory.0);
+
+        let target_address = listener_address();
+        let listener_thread = {
+            let store = listener_store.clone();
+            thread::spawn(move || {
+                listen_for_pairing(store, target_address, Duration::from_secs(5)).unwrap()
+            })
+        };
+        let attacker_as_connector = connect_for_pairing(
+            attacker_store.clone(),
+            target_address,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let real_listener = listener_thread.join().unwrap();
+
+        let attacker_address = listener_address();
+        let attacker_thread = {
+            let store = attacker_store.clone();
+            thread::spawn(move || {
+                listen_for_pairing(store, attacker_address, Duration::from_secs(5)).unwrap()
+            })
+        };
+        let real_connector = connect_for_pairing(
+            connector_store.clone(),
+            attacker_address,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let attacker_as_listener = attacker_thread.join().unwrap();
+
+        assert_ne!(real_listener.code(), real_connector.code());
+
+        let listener_reject =
+            thread::spawn(move || real_listener.confirm(false, "Expected connector"));
+        assert!(
+            attacker_as_connector
+                .confirm(false, "Target listener")
+                .is_err()
+        );
+        assert!(listener_reject.join().unwrap().is_err());
+
+        let attacker_reject =
+            thread::spawn(move || attacker_as_listener.confirm(false, "Target connector"));
+        assert!(real_connector.confirm(false, "Expected listener").is_err());
+        assert!(attacker_reject.join().unwrap().is_err());
+
+        assert!(listener_store.list_peers().unwrap().is_empty());
+        assert!(connector_store.list_peers().unwrap().is_empty());
+        assert!(attacker_store.list_peers().unwrap().is_empty());
+    }
+
+    #[test]
     fn oversized_certificate_is_rejected_before_allocation() {
         let mut header = [0_u8; HELLO_HEADER_LENGTH];
         header[..8].copy_from_slice(HELLO_MAGIC);
@@ -598,5 +658,57 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         assert!(Hello::read_from(&mut stream, Role::Connector).is_err());
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn pairing_hello_parser_rejects_bounded_malformed_corpus() {
+        let mut corpus = Vec::new();
+        for length in 0..HELLO_HEADER_LENGTH {
+            corpus.push(vec![0_u8; length]);
+        }
+
+        let mut invalid_magic = [0_u8; HELLO_HEADER_LENGTH];
+        invalid_magic[..8].copy_from_slice(b"NOTPAIR!");
+        invalid_magic[8..10].copy_from_slice(&PAIRING_VERSION.to_le_bytes());
+        invalid_magic[10] = Role::Connector as u8;
+        invalid_magic[43..47].copy_from_slice(&1_u32.to_le_bytes());
+        corpus.push(invalid_magic.to_vec());
+
+        let mut invalid_version = invalid_magic;
+        invalid_version[..8].copy_from_slice(HELLO_MAGIC);
+        invalid_version[8..10].copy_from_slice(&PAIRING_VERSION.wrapping_add(1).to_le_bytes());
+        corpus.push(invalid_version.to_vec());
+
+        let mut invalid_role = invalid_magic;
+        invalid_role[..8].copy_from_slice(HELLO_MAGIC);
+        invalid_role[10] = 0xFF;
+        corpus.push(invalid_role.to_vec());
+
+        let mut wrong_role = invalid_magic;
+        wrong_role[..8].copy_from_slice(HELLO_MAGIC);
+        wrong_role[10] = Role::Listener as u8;
+        corpus.push(wrong_role.to_vec());
+
+        let mut empty_certificate = invalid_magic;
+        empty_certificate[..8].copy_from_slice(HELLO_MAGIC);
+        empty_certificate[43..47].copy_from_slice(&0_u32.to_le_bytes());
+        corpus.push(empty_certificate.to_vec());
+
+        let mut oversized = empty_certificate;
+        oversized[43..47]
+            .copy_from_slice(&(u32::try_from(CERTIFICATE_LIMIT).unwrap() + 1).to_le_bytes());
+        corpus.push(oversized.to_vec());
+
+        let mut missing_certificate = empty_certificate;
+        missing_certificate[43..47].copy_from_slice(&16_u32.to_le_bytes());
+        corpus.push(missing_certificate.to_vec());
+
+        for bytes in corpus {
+            let error = Hello::read_from(&mut bytes.as_slice(), Role::Connector).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ));
+        }
     }
 }

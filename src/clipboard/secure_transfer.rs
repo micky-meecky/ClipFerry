@@ -2467,4 +2467,62 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn secure_frame_parser_survives_a_deterministic_mutation_sweep() {
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut accepted = 0_usize;
+        let mut rejected = 0_usize;
+
+        for case in 0..2048_u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let actual_length = usize::try_from(state & 0x0FFF).unwrap();
+            let mut bytes = vec![0_u8; FRAME_HEADER_LEN + actual_length];
+            bytes[..4].copy_from_slice(&MAGIC);
+            bytes[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+            let opcode = u16::try_from(state & u64::from(u16::MAX)).unwrap();
+            bytes[6..8].copy_from_slice(&opcode.to_be_bytes());
+            bytes[8..16].copy_from_slice(&state.to_be_bytes());
+            for (index, byte) in bytes[FRAME_HEADER_LEN..].iter_mut().enumerate() {
+                *byte = u8::try_from(
+                    state.rotate_left(u32::try_from(index % 64).unwrap()) & u64::from(u8::MAX),
+                )
+                .unwrap();
+            }
+
+            let declared_length = match case % 5 {
+                0 => u32::try_from(actual_length).unwrap(),
+                1 => u32::try_from(actual_length + 1).unwrap(),
+                2 => {
+                    bytes[usize::try_from(case).unwrap() % 4] ^= 0x80;
+                    u32::try_from(actual_length).unwrap()
+                }
+                3 => {
+                    bytes[4] ^= 0x40;
+                    u32::try_from(actual_length).unwrap()
+                }
+                _ => u32::try_from(MAX_FRAME_PAYLOAD).unwrap() + 1,
+            };
+            bytes[16..20].copy_from_slice(&declared_length.to_be_bytes());
+
+            match read_frame(&mut bytes.as_slice()) {
+                Ok(frame) => {
+                    accepted += 1;
+                    assert_eq!(frame.payload.len(), actual_length);
+                }
+                Err(error) => {
+                    rejected += 1;
+                    assert!(matches!(
+                        error.kind(),
+                        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                    ));
+                }
+            }
+        }
+
+        assert!(accepted > 0);
+        assert!(rejected > 0);
+    }
 }
