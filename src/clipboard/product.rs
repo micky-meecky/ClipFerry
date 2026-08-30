@@ -27,8 +27,8 @@ use windows_core::{Error, HRESULT, Interface, Result as WindowsResult, w};
 
 use super::data_object::{SourceFactory, VirtualFileDataObject, VirtualFileEntry};
 use super::local_file::{
-    CaptureFormats, ClipboardCapture, FileTreeSnapshot, LocalOfferRegistry,
-    capture_files_from_clipboard,
+    CaptureError, CaptureFormats, CaptureRejection, ClipboardCapture, FileTreeSnapshot,
+    LocalOfferRegistry, capture_files_from_clipboard,
 };
 use super::probe::ProbeState;
 use super::runtime::ole_set_clipboard_with_retry;
@@ -470,8 +470,14 @@ impl ProductSession {
     }
 
     fn publish_paths(&mut self, paths: &[std::path::PathBuf]) -> io::Result<()> {
-        let tree = FileTreeSnapshot::capture(paths)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let tree = FileTreeSnapshot::capture(paths).map_err(|error| {
+            let message = match error {
+                CaptureError::Rejected(CaptureRejection::AlternateDataStream) =>
+                    "所选内容包含 NTFS 附加数据流（通常是 Windows 的下载来源标记）。当前虚拟粘贴无法在目标端安全保留该标记，因此已停止发送；请先确认来源并在文件属性中解除锁定后重试。".to_owned(),
+                other => other.to_string(),
+            };
+            io::Error::other(message)
+        })?;
         let offer = self
             .registry
             .publish_tree(&tree, OFFER_TTL)
@@ -727,6 +733,7 @@ impl ProductSession {
     fn set_error(&self, error: String) {
         let _ = append_product_log(&self.log_path, &format!("product_error error={error}"));
         self.update_snapshot(|snapshot| snapshot.last_error = Some(error));
+        let _ = crate::tray::show_runtime_error_existing();
     }
 
     fn update_snapshot(&self, update: impl FnOnce(&mut ProductSnapshot)) {

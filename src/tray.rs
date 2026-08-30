@@ -3,9 +3,13 @@ use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::mem::size_of;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE,
@@ -26,25 +30,29 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW,
     GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HICON,
-    HWND_MESSAGE, IDI_APPLICATION, LR_DEFAULTCOLOR, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_OK, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
-    SM_CYSMICON, SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW,
+    HWND_MESSAGE, IDI_APPLICATION, IDYES, LR_DEFAULTCOLOR, LoadIconW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_YESNO, MENU_ITEM_FLAGS,
+    MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
+    SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_QUERYENDSESSION,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 use windows_core::{PCWSTR, w};
 
 use crate::app_settings::AppSettings;
 use crate::clipboard::{ProductCommand, ProductRuntime, ProductTransferState};
 use crate::device_store::DeviceStore;
+use crate::discovery::{DiscoveryRuntime, DiscoveryView, PAIRING_PORT, activate_discovered_peer};
+use crate::pairing::{PendingPairing, connect_for_pairing, listen_for_pairing};
 
 const TRAY_WINDOW_CLASS: PCWSTR = w!("ClipFerryTrayWindow");
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const TRAY_SHOW_STATUS_MESSAGE: u32 = WM_APP + 2;
 const TRAY_EXIT_MESSAGE: u32 = WM_APP + 3;
 const TRAY_RELOAD_MESSAGE: u32 = WM_APP + 4;
+const TRAY_RUNTIME_ERROR_MESSAGE: u32 = WM_APP + 5;
 const TRAY_ICON_ID: u32 = 1;
 const SINGLE_INSTANCE_NAME: PCWSTR = w!("Local\\ClipFerry.Tray.v1");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -104,6 +112,184 @@ impl Drop for SingleInstance {
     }
 }
 
+struct PairingRuntime {
+    stop: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PairingRuntime {
+    fn start(store: DeviceStore, discovery: DiscoveryView, log_path: PathBuf) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_busy = Arc::clone(&busy);
+        let worker = thread::Builder::new()
+            .name("clipferry-pairing-listener".to_owned())
+            .spawn(move || {
+                pairing_listener_loop(&store, &discovery, &log_path, &worker_stop, &worker_busy);
+            })?;
+        Ok(Self {
+            stop,
+            busy,
+            worker: Some(worker),
+        })
+    }
+
+    fn connect(
+        &self,
+        store: DeviceStore,
+        discovery: DiscoveryView,
+        peer: crate::discovery::DiscoveredPeer,
+        log_path: PathBuf,
+    ) -> io::Result<()> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "已有配对确认正在进行",
+            ));
+        }
+        let busy = Arc::clone(&self.busy);
+        thread::Builder::new()
+            .name("clipferry-pairing-connector".to_owned())
+            .spawn(move || {
+                let result = connect_for_pairing(
+                    store.clone(),
+                    peer.pairing_endpoint,
+                    Duration::from_mins(2),
+                )
+                .and_then(|pending| {
+                    complete_native_pairing(&store, &discovery, pending, Some(peer))
+                });
+                log_pairing_result(&log_path, &result);
+                busy.store(false, Ordering::Release);
+            })?;
+        Ok(())
+    }
+}
+
+impl Drop for PairingRuntime {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, PAIRING_PORT)),
+            Duration::from_millis(200),
+        );
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn pairing_listener_loop(
+    store: &DeviceStore,
+    discovery: &DiscoveryView,
+    log_path: &Path,
+    stop: &AtomicBool,
+    busy: &AtomicBool,
+) {
+    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, PAIRING_PORT));
+    while !stop.load(Ordering::Acquire) {
+        let result = listen_for_pairing(store.clone(), address, Duration::from_mins(2));
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match result {
+            Ok(pending) => {
+                if busy
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    let _ = pending.confirm(false, "设备");
+                    continue;
+                }
+                let result = complete_native_pairing(store, discovery, pending, None);
+                log_pairing_result(log_path, &result);
+                busy.store(false, Ordering::Release);
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => {
+                let _ = append_log(log_path, &format!("pairing_listener_error error={error}"));
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn complete_native_pairing(
+    store: &DeviceStore,
+    discovery: &DiscoveryView,
+    pending: PendingPairing,
+    known_peer: Option<crate::discovery::DiscoveredPeer>,
+) -> io::Result<()> {
+    let fingerprint = pending.peer_fingerprint();
+    let peer_address = pending.peer_address();
+    let discovered = known_peer
+        .filter(|peer| peer.fingerprint == fingerprint)
+        .or_else(|| discovery.peer(fingerprint));
+    let Some(discovered) = discovered else {
+        let _ = pending.confirm(false, "未发现设备");
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "对端身份与局域网发现记录不匹配，已拒绝配对",
+        ));
+    };
+    if discovered.service_endpoint.ip() != peer_address.ip() {
+        let _ = pending.confirm(false, "地址不匹配的设备");
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "对端连接地址与局域网发现记录不匹配，已拒绝配对",
+        ));
+    }
+    let label = discovered.label.clone();
+    if store.load_peer(fingerprint).is_ok() {
+        let _ = pending.confirm(false, &label);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "该设备已经配对，无需重复确认",
+        ));
+    }
+    let approved = ask_yes_no(
+        &format!(
+            "设备“{label}”请求与本机配对。\r\n\r\n请在两台电脑上核对下面的验证码完全一致：\r\n\r\n{}\r\n\r\n对端指纹：\r\n{fingerprint}\r\n\r\n是否允许配对？",
+            pending.code()
+        ),
+        "ClipFerry 设备配对",
+    );
+    let peer = pending.confirm(approved, &label)?;
+    activate_discovered_peer(store, &discovered)?;
+    let _ = reload_existing();
+    show_information(
+        HWND::default(),
+        &format!("已与“{}”安全配对，局域网连接地址已自动保存。", peer.label),
+        "ClipFerry",
+    );
+    Ok(())
+}
+
+fn log_pairing_result(log_path: &Path, result: &io::Result<()>) {
+    let message = match result {
+        Ok(()) => "pairing_native completed=true".to_owned(),
+        Err(error) => format!("pairing_native completed=false error={error}"),
+    };
+    let _ = append_log(log_path, &message);
+    if let Err(error) = result {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            show_information(
+                HWND::default(),
+                &format!("配对未完成：{error}"),
+                "ClipFerry",
+            );
+        } else {
+            show_error(HWND::default(), &format!("配对失败：{error}"));
+        }
+    }
+}
+
 struct OwnedIcon {
     handle: HICON,
     owned: bool,
@@ -153,6 +339,9 @@ struct TrayState {
     log_path: PathBuf,
     icon: OwnedIcon,
     taskbar_created: u32,
+    discovery: Option<DiscoveryRuntime>,
+    discovery_error: Option<String>,
+    pairing: Option<PairingRuntime>,
     runtime: Option<ProductRuntime>,
     runtime_error: Option<String>,
 }
@@ -175,12 +364,27 @@ impl TrayState {
         if taskbar_created == 0 {
             return Err(io::Error::last_os_error());
         }
+        let (discovery, discovery_error) = match DiscoveryRuntime::start(store.clone()) {
+            Ok(runtime) => (Some(runtime), None),
+            Err(error) => (None, Some(format!("局域网自动发现启动失败：{error}"))),
+        };
+        let pairing = discovery.as_ref().and_then(|runtime| {
+            PairingRuntime::start(store.clone(), runtime.view(), log_path.clone())
+                .map_err(|error| {
+                    append_log(&log_path, &format!("pairing_listener_start error={error}")).ok();
+                    error
+                })
+                .ok()
+        });
         let (runtime, runtime_error) = start_product_runtime(&store);
         Ok(Self {
             store,
             log_path,
             icon: OwnedIcon::load()?,
             taskbar_created,
+            discovery,
+            discovery_error,
+            pairing,
             runtime,
             runtime_error,
         })
@@ -281,11 +485,20 @@ impl TrayState {
                         .unwrap_or_else(|| "无".to_owned()),
                 )
             };
+        let discovery = self.discovery.as_ref().map_or_else(
+            || {
+                self.discovery_error
+                    .clone()
+                    .unwrap_or_else(|| "不可用".to_owned())
+            },
+            |runtime| format!("运行中，当前发现 {} 台设备", runtime.view().peers().len()),
+        );
         Ok(format!(
-            "ClipFerry 正在后台运行\r\n\r\n本机设备\r\n{}\r\n\r\n已配对设备（{}）\r\n{}\r\n\r\n连接状态：{}\r\n最近远端清单：{}\r\n活动传输：{}\r\n最近错误：{}\r\n开机自启动：{}",
+            "ClipFerry 正在后台运行\r\n\r\n本机设备\r\n{}\r\n\r\n已配对设备（{}）\r\n{}\r\n\r\n局域网发现：{}\r\n连接状态：{}\r\n最近远端清单：{}\r\n活动传输：{}\r\n最近错误：{}\r\n开机自启动：{}",
             identity.fingerprint(),
             peers.len(),
             peer_lines,
+            discovery,
             connection,
             recent_manifest,
             active_transfer,
@@ -327,7 +540,7 @@ impl TrayState {
     fn handle_command(&mut self, window: HWND, command: usize) {
         let result = match command {
             COMMAND_STATUS => self.show_status(window),
-            COMMAND_PAIR => Self::spawn_console("pair-wizard"),
+            COMMAND_PAIR => self.start_pairing(window),
             COMMAND_MANAGE_PEERS => Self::spawn_console("trust-wizard"),
             COMMAND_SETTINGS => Self::spawn_console("settings-wizard"),
             COMMAND_ACCEPT_PENDING => self.product_command(ProductCommand::AcceptPending),
@@ -353,6 +566,66 @@ impl TrayState {
     fn show_status(&self, window: HWND) -> io::Result<()> {
         let snapshot = self.snapshot()?;
         show_information(window, &snapshot, "ClipFerry 状态");
+        Ok(())
+    }
+
+    fn show_runtime_error(&self, window: HWND) {
+        let error = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.snapshot().last_error)
+            .or_else(|| self.runtime_error.clone())
+            .unwrap_or_else(|| "后台传输发生未知错误".to_owned());
+        show_error(window, &error);
+    }
+
+    fn start_pairing(&self, window: HWND) -> io::Result<()> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                self.discovery_error
+                    .as_deref()
+                    .unwrap_or("局域网自动发现尚未启动"),
+            )
+        })?;
+        let pairing = self
+            .pairing
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "自动配对监听器尚未启动"))?;
+        let candidates = discovery
+            .view()
+            .peers()
+            .into_iter()
+            .filter(|peer| self.store.load_peer(peer.fingerprint).is_err())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            show_information(
+                window,
+                "暂未发现可配对的新设备。\r\n\r\n请确认另一台电脑已打开 ClipFerry、位于同一局域网，并在 Windows 防火墙中允许专用网络。等待几秒后再试。",
+                "ClipFerry 设备配对",
+            );
+            return Ok(());
+        }
+        let selected = candidates.into_iter().find(|peer| {
+            ask_yes_no(
+                &format!(
+                    "发现设备“{}”\r\n地址：{}\r\n指纹：{}\r\n\r\n要与这台设备开始安全配对吗？",
+                    peer.label,
+                    peer.service_endpoint.ip(),
+                    peer.fingerprint
+                ),
+                "ClipFerry 发现新设备",
+            )
+        });
+        let Some(peer) = selected else {
+            return Ok(());
+        };
+        pairing.connect(
+            self.store.clone(),
+            discovery.view(),
+            peer,
+            self.log_path.clone(),
+        )?;
         Ok(())
     }
 
@@ -454,7 +727,7 @@ impl TrayState {
         menu.append("查看状态", COMMAND_STATUS, MF_STRING)?;
         menu.append("配对新设备…", COMMAND_PAIR, MF_STRING)?;
         menu.append("管理已配对设备…", COMMAND_MANAGE_PEERS, MF_STRING)?;
-        menu.append("连接设置…", COMMAND_SETTINGS, MF_STRING)?;
+        menu.append("高级连接设置…", COMMAND_SETTINGS, MF_STRING)?;
         menu.separator()?;
         let product = self.runtime.as_ref().map(ProductRuntime::snapshot);
         let pending = product.as_ref().is_some_and(|value| value.pending_offer);
@@ -756,6 +1029,10 @@ unsafe extern "system" fn tray_window_procedure(
             state.reload_runtime();
             return LRESULT(0);
         }
+        if message == TRAY_RUNTIME_ERROR_MESSAGE {
+            state.show_runtime_error(window);
+            return LRESULT(0);
+        }
         if message == WM_COMMAND {
             state.handle_command(window, wparam.0 & 0xffff);
             return LRESULT(0);
@@ -832,6 +1109,15 @@ pub fn exit_existing() -> Result<(), String> {
 /// Returns an error if no instance exists or the private notification cannot be posted.
 pub fn reload_existing() -> Result<(), String> {
     post_to_existing(TRAY_RELOAD_MESSAGE).map_err(|error| error.to_string())
+}
+
+/// Asks the tray to surface the current product-runtime error in a recoverable native dialog.
+///
+/// # Errors
+///
+/// Returns an error if no tray instance exists or the private notification cannot be posted.
+pub fn show_runtime_error_existing() -> Result<(), String> {
+    post_to_existing(TRAY_RUNTIME_ERROR_MESSAGE).map_err(|error| error.to_string())
 }
 
 fn post_to_existing(message: u32) -> io::Result<()> {
@@ -1052,25 +1338,40 @@ fn show_error(window: HWND, message: &str) {
     show_message(window, message, "ClipFerry", MB_OK | MB_ICONERROR);
 }
 
+fn ask_yes_no(message: &str, title: &str) -> bool {
+    let message = wide_null(message.as_ref());
+    let title = wide_null(title.as_ref());
+    // SAFETY: both strings are null terminated and remain live for the modal call. The dialog is
+    // deliberately unowned so it has an independent taskbar entry and cannot become stranded
+    // behind the message-only tray window.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+        ) == IDYES
+    }
+}
+
 fn show_message(
-    window: HWND,
+    _window: HWND,
     message: &str,
     title: &str,
     style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
 ) {
     let message = wide_null(message.as_ref());
     let title = wide_null(title.as_ref());
-    // SAFETY: both strings are null terminated and remain live for the modal call.
+    // SAFETY: both strings are null terminated and remain live for the modal call. The tray
+    // window is message-only; making it an owner hides the dialog from the taskbar and can make
+    // an occluded modal impossible to recover. An unowned foreground dialog gets its own taskbar
+    // entry and remains independently closable.
     let _ = unsafe {
         MessageBoxW(
-            if window.0.is_null() {
-                None
-            } else {
-                Some(window)
-            },
+            None,
             PCWSTR(message.as_ptr()),
             PCWSTR(title.as_ptr()),
-            style,
+            style | MB_SETFOREGROUND,
         )
     };
 }

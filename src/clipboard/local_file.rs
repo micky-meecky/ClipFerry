@@ -341,7 +341,13 @@ impl FileSnapshot {
         if file_type != FILE_TYPE_DISK {
             return Err(CaptureError::Rejected(CaptureRejection::NonDiskFile));
         }
-        if has_named_data_stream(&file).map_err(CaptureError::Windows)? {
+        // Directories never expose FILECONTENTS. Some Windows volumes reject
+        // FileStreamInfo for directory handles with E_INVALIDARG, so querying
+        // them both breaks otherwise valid trees and provides no content
+        // protection. Every ordinary child file is still checked here and
+        // again when its stable content handle is opened.
+        let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        if !is_directory && has_named_data_stream(&file).map_err(CaptureError::Windows)? {
             return Err(CaptureError::Rejected(
                 CaptureRejection::AlternateDataStream,
             ));

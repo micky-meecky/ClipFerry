@@ -1,6 +1,7 @@
 pub mod app_settings;
 pub mod clipboard;
 pub mod device_store;
+pub mod discovery;
 pub mod pairing;
 pub mod security;
 pub mod tray;

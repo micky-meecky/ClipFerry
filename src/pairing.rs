@@ -247,7 +247,7 @@ pub fn listen_for_pairing(
     address: SocketAddr,
     timeout: Duration,
 ) -> io::Result<PendingPairing> {
-    validate_endpoint(address)?;
+    validate_listener_endpoint(address)?;
     validate_timeout(timeout)?;
     let stored = store.load_or_create_identity()?;
     let local = Hello::create(Role::Listener, stored.identity.certificate_der().to_vec())?;
@@ -387,7 +387,21 @@ fn validate_timeout(timeout: Duration) -> io::Result<()> {
 }
 
 fn validate_endpoint(address: SocketAddr) -> io::Result<()> {
+    if address.port() == 0 {
+        return Err(invalid_data("pairing endpoint port must not be zero"));
+    }
     validate_peer_address(address.ip())
+}
+
+fn validate_listener_endpoint(address: SocketAddr) -> io::Result<()> {
+    if address.port() == 0 {
+        return Err(invalid_data("pairing listener port must not be zero"));
+    }
+    if address.ip().is_unspecified() {
+        Ok(())
+    } else {
+        validate_peer_address(address.ip())
+    }
 }
 
 fn validate_peer_address(address: IpAddr) -> io::Result<()> {
@@ -452,6 +466,14 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         address
+    }
+
+    #[test]
+    fn wildcard_is_allowed_only_for_the_local_listener() {
+        let wildcard = "0.0.0.0:45232".parse().unwrap();
+        assert!(validate_listener_endpoint(wildcard).is_ok());
+        assert!(validate_endpoint(wildcard).is_err());
+        assert!(validate_listener_endpoint("0.0.0.0:0".parse().unwrap()).is_err());
     }
 
     #[test]

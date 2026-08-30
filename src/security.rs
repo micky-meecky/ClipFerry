@@ -36,6 +36,11 @@ impl CertificateFingerprint {
     pub fn bytes(self) -> [u8; 32] {
         self.0
     }
+
+    #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl std::fmt::Display for CertificateFingerprint {
