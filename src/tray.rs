@@ -37,12 +37,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{PCWSTR, w};
 
+use crate::app_settings::AppSettings;
+use crate::clipboard::{ProductCommand, ProductRuntime, ProductTransferState};
 use crate::device_store::DeviceStore;
 
 const TRAY_WINDOW_CLASS: PCWSTR = w!("ClipFerryTrayWindow");
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const TRAY_SHOW_STATUS_MESSAGE: u32 = WM_APP + 2;
 const TRAY_EXIT_MESSAGE: u32 = WM_APP + 3;
+const TRAY_RELOAD_MESSAGE: u32 = WM_APP + 4;
 const TRAY_ICON_ID: u32 = 1;
 const SINGLE_INSTANCE_NAME: PCWSTR = w!("Local\\ClipFerry.Tray.v1");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -58,6 +61,8 @@ const COMMAND_CANCEL: usize = 1006;
 const COMMAND_AUTOSTART: usize = 1007;
 const COMMAND_LOG: usize = 1008;
 const COMMAND_EXIT: usize = 1009;
+const COMMAND_SETTINGS: usize = 1010;
+const COMMAND_ACCEPT_PENDING: usize = 1011;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutostartState {
@@ -149,6 +154,8 @@ struct TrayState {
     log_path: PathBuf,
     icon: OwnedIcon,
     taskbar_created: u32,
+    runtime: Option<ProductRuntime>,
+    runtime_error: Option<String>,
 }
 
 impl TrayState {
@@ -169,14 +176,18 @@ impl TrayState {
         if taskbar_created == 0 {
             return Err(io::Error::last_os_error());
         }
+        let (runtime, runtime_error) = start_product_runtime(&store);
         Ok(Self {
             store,
             log_path,
             icon: OwnedIcon::load()?,
             taskbar_created,
+            runtime,
+            runtime_error,
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn snapshot(&self) -> io::Result<String> {
         let identity = self.store.load_identity()?;
         let peers = self.store.list_peers()?;
@@ -190,11 +201,96 @@ impl TrayState {
                 .join("\r\n")
         };
         let autostart = query_autostart()?.label();
+        let (connection, recent_manifest, active_transfer, runtime_error) =
+            if let Some(runtime) = self.runtime.as_ref() {
+                let product = runtime.snapshot();
+                let connection = format!(
+                    "{} · {} · 监听 {} · 自动接收 {}",
+                    if product.listener_running {
+                        "在线"
+                    } else {
+                        "正在停止"
+                    },
+                    product.active_peer_label,
+                    product.local_endpoint,
+                    if product.auto_receive {
+                        "开启"
+                    } else {
+                        "关闭"
+                    }
+                );
+                let recent_manifest = product.last_manifest.as_ref().map_or_else(
+                    || "暂无".to_owned(),
+                    |manifest| {
+                        format!(
+                            "{} · {} · {} 个文件/{} 个目录 · {}",
+                            manifest.direction,
+                            manifest.primary_name,
+                            manifest.files,
+                            manifest.directories,
+                            format_bytes(manifest.total_size)
+                        )
+                    },
+                );
+                let active_transfer = product.transfer.as_ref().map_or_else(
+                    || {
+                        if product.pending_offer {
+                            "有待确认的远端文件清单".to_owned()
+                        } else {
+                            "暂无".to_owned()
+                        }
+                    },
+                    |transfer| {
+                        let percentage_tenths = transfer
+                            .transferred
+                            .saturating_mul(1000)
+                            .checked_div(transfer.total_size)
+                            .unwrap_or(1000);
+                        format!(
+                            "{} · {}.{}% · {} / {} · {}/s · 文件 {}/{}",
+                            transfer.state.label(),
+                            percentage_tenths / 10,
+                            percentage_tenths % 10,
+                            format_bytes(transfer.transferred),
+                            format_bytes(transfer.total_size),
+                            format_bytes(transfer.bytes_per_second),
+                            transfer.started_files,
+                            transfer.total_files
+                        )
+                    },
+                );
+                (
+                    connection,
+                    recent_manifest,
+                    active_transfer,
+                    product.last_error.unwrap_or_else(|| "无".to_owned()),
+                )
+            } else {
+                let connection = match AppSettings::load(&self.store) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        "尚未配置（请打开“连接设置”）".to_owned()
+                    }
+                    Ok(_) => "配置已保存，但后台服务未启动".to_owned(),
+                    Err(error) => format!("配置不可用：{error}"),
+                };
+                (
+                    connection,
+                    "暂无".to_owned(),
+                    "暂无".to_owned(),
+                    self.runtime_error
+                        .clone()
+                        .unwrap_or_else(|| "无".to_owned()),
+                )
+            };
         Ok(format!(
-            "ClipFerry 正在后台运行\r\n\r\n本机设备\r\n{}\r\n\r\n已配对设备（{}）\r\n{}\r\n\r\n连接状态：等待已配对设备\r\n最近远端清单：暂无\r\n活动传输：暂无\r\n开机自启动：{}",
+            "ClipFerry 正在后台运行\r\n\r\n本机设备\r\n{}\r\n\r\n已配对设备（{}）\r\n{}\r\n\r\n连接状态：{}\r\n最近远端清单：{}\r\n活动传输：{}\r\n最近错误：{}\r\n开机自启动：{}",
             identity.fingerprint(),
             peers.len(),
             peer_lines,
+            connection,
+            recent_manifest,
+            active_transfer,
+            runtime_error,
             autostart
         ))
     }
@@ -234,10 +330,11 @@ impl TrayState {
             COMMAND_STATUS => self.show_status(window),
             COMMAND_PAIR => Self::spawn_console("pair-wizard"),
             COMMAND_MANAGE_PEERS => Self::spawn_console("trust-wizard"),
-            COMMAND_PAUSE | COMMAND_RESUME | COMMAND_CANCEL => {
-                show_information(window, "当前没有活动传输。", "ClipFerry");
-                Ok(())
-            }
+            COMMAND_SETTINGS => Self::spawn_console("settings-wizard"),
+            COMMAND_ACCEPT_PENDING => self.product_command(ProductCommand::AcceptPending),
+            COMMAND_PAUSE => self.product_command(ProductCommand::Pause),
+            COMMAND_RESUME => self.product_command(ProductCommand::Resume),
+            COMMAND_CANCEL => self.product_command(ProductCommand::Cancel),
             COMMAND_AUTOSTART => self.toggle_autostart(window),
             COMMAND_LOG => self.open_log(),
             COMMAND_EXIT => {
@@ -258,6 +355,25 @@ impl TrayState {
         let snapshot = self.snapshot()?;
         show_information(window, &snapshot, "ClipFerry 状态");
         Ok(())
+    }
+
+    fn product_command(&self, command: ProductCommand) -> io::Result<()> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "后台传输服务尚未启动"))?
+            .command(command)
+    }
+
+    fn reload_runtime(&mut self) {
+        self.runtime.take();
+        let (runtime, error) = start_product_runtime(&self.store);
+        self.runtime = runtime;
+        self.runtime_error = error;
+        let message = self.runtime_error.as_ref().map_or_else(
+            || "settings_reload success=true".to_owned(),
+            |error| format!("settings_reload success=false error={error}"),
+        );
+        let _ = append_log(&self.log_path, &message);
     }
 
     fn toggle_autostart(&self, window: HWND) -> io::Result<()> {
@@ -322,10 +438,41 @@ impl TrayState {
         menu.append("查看状态", COMMAND_STATUS, MF_STRING)?;
         menu.append("配对新设备…", COMMAND_PAIR, MF_STRING)?;
         menu.append("管理已配对设备…", COMMAND_MANAGE_PEERS, MF_STRING)?;
+        menu.append("连接设置…", COMMAND_SETTINGS, MF_STRING)?;
         menu.separator()?;
-        menu.append("暂停传输", COMMAND_PAUSE, MF_STRING | MF_DISABLED)?;
-        menu.append("继续传输", COMMAND_RESUME, MF_STRING | MF_DISABLED)?;
-        menu.append("取消传输", COMMAND_CANCEL, MF_STRING | MF_DISABLED)?;
+        let product = self.runtime.as_ref().map(ProductRuntime::snapshot);
+        let pending = product.as_ref().is_some_and(|value| value.pending_offer);
+        let transfer_state = product
+            .as_ref()
+            .and_then(|value| value.transfer.as_ref())
+            .map(|value| value.state);
+        menu.append(
+            "接收待确认的文件剪贴板",
+            COMMAND_ACCEPT_PENDING,
+            enabled_menu_flags(pending),
+        )?;
+        menu.append(
+            "暂停传输",
+            COMMAND_PAUSE,
+            enabled_menu_flags(transfer_state == Some(ProductTransferState::Running)),
+        )?;
+        menu.append(
+            "继续传输",
+            COMMAND_RESUME,
+            enabled_menu_flags(transfer_state == Some(ProductTransferState::Paused)),
+        )?;
+        menu.append(
+            "取消传输",
+            COMMAND_CANCEL,
+            enabled_menu_flags(matches!(
+                transfer_state,
+                Some(
+                    ProductTransferState::AwaitingPaste
+                        | ProductTransferState::Running
+                        | ProductTransferState::Paused
+                )
+            )),
+        )?;
         menu.separator()?;
         let autostart_flags = if query_autostart()? == AutostartState::Enabled {
             MF_STRING | MF_CHECKED
@@ -360,6 +507,52 @@ impl TrayState {
         }
         Ok(())
     }
+}
+
+fn start_product_runtime(store: &DeviceStore) -> (Option<ProductRuntime>, Option<String>) {
+    let settings = match AppSettings::load(store) {
+        Ok(settings) => settings,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (None, None),
+        Err(error) => return (None, Some(format!("连接设置不可用：{error}"))),
+    };
+    match ProductRuntime::start(store.clone(), settings) {
+        Ok(runtime) => (Some(runtime), None),
+        Err(error) => (None, Some(format!("后台服务启动失败：{error}"))),
+    }
+}
+
+fn enabled_menu_flags(enabled: bool) -> MENU_ITEM_FLAGS {
+    if enabled {
+        MF_STRING
+    } else {
+        MF_STRING | MF_DISABLED
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format_scaled_bytes(bytes, GIB, 2, "GiB")
+    } else if bytes >= MIB {
+        format_scaled_bytes(bytes, MIB, 1, "MiB")
+    } else if bytes >= KIB {
+        format_scaled_bytes(bytes, KIB, 1, "KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_scaled_bytes(bytes: u64, unit: u64, decimals: u32, suffix: &str) -> String {
+    let factor = 10_u64.pow(decimals);
+    let fraction = u128::from(bytes % unit) * u128::from(factor) / u128::from(unit);
+    format!(
+        "{}.{:0width$} {suffix}",
+        bytes / unit,
+        fraction,
+        width = decimals as usize
+    )
 }
 
 struct PopupMenu {
@@ -543,6 +736,10 @@ unsafe extern "system" fn tray_window_procedure(
             unsafe { PostQuitMessage(0) };
             return LRESULT(0);
         }
+        if message == TRAY_RELOAD_MESSAGE {
+            state.reload_runtime();
+            return LRESULT(0);
+        }
         if message == WM_COMMAND {
             state.handle_command(window, wparam.0 & 0xffff);
             return LRESULT(0);
@@ -610,6 +807,15 @@ pub fn show_existing_status() -> Result<(), String> {
 /// Returns an error if no instance window exists or the message cannot be posted.
 pub fn exit_existing() -> Result<(), String> {
     post_to_existing(TRAY_EXIT_MESSAGE).map_err(|error| error.to_string())
+}
+
+/// Notifies the running tray instance that persisted settings changed.
+///
+/// # Errors
+///
+/// Returns an error if no instance exists or the private notification cannot be posted.
+pub fn reload_existing() -> Result<(), String> {
+    post_to_existing(TRAY_RELOAD_MESSAGE).map_err(|error| error.to_string())
 }
 
 fn post_to_existing(message: u32) -> io::Result<()> {

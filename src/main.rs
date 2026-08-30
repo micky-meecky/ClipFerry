@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use clipferry::app_settings::AppSettings;
 use clipferry::clipboard::secure_transfer::{SecureOfferClient, SecureRecoveryPolicy};
 use clipferry::clipboard::{
     ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
@@ -67,6 +68,8 @@ fn run() -> Result<(), String> {
         }
         "pair-wizard" => run_pair_wizard(),
         "trust-wizard" => run_trust_wizard(),
+        "settings-wizard" => run_settings_wizard(),
+        "settings-show" => run_settings_show(),
         "clipboard-test" => {
             let mut lifetime = None;
             while let Some(argument) = arguments.next() {
@@ -250,7 +253,7 @@ fn print_usage() {
     println!("  clipferry tray [--console]");
     println!("  clipferry tray-self-test|tray-show|tray-exit");
     println!("  clipferry autostart-status|autostart-enable|autostart-disable");
-    println!("  clipferry pair-wizard|trust-wizard");
+    println!("  clipferry pair-wizard|trust-wizard|settings-wizard|settings-show");
     println!("  clipferry clipboard-test [--lifetime-seconds <seconds>]");
     println!(
         "  clipferry clipboard-pause-test [--size-mib <MiB>] [--chunk-kib <KiB>] [--delay-ms <ms>] [--async-mode] [--lifetime-seconds <seconds>]"
@@ -397,6 +400,130 @@ fn run_trust_wizard_inner() -> Result<(), String> {
         .revoke_peer(peer.fingerprint)
         .map_err(|error| format!("trust revocation failed: {error}"))?;
     println!("已取消配对：{}", peer.label);
+    let _ = clipferry::tray::reload_existing();
+    Ok(())
+}
+
+fn run_settings_wizard() -> Result<(), String> {
+    let result = run_settings_wizard_inner();
+    if let Err(error) = &result {
+        eprintln!("\n连接设置失败：{error}");
+    }
+    wait_for_enter("\n按 Enter 关闭此窗口...")?;
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_settings_wizard_inner() -> Result<(), String> {
+    let store = DeviceStore::current_user()
+        .map_err(|error| format!("device store unavailable: {error}"))?;
+    let identity = store
+        .load_or_create_identity()
+        .map_err(|error| format!("device identity initialization failed: {error}"))?;
+    let peers = store
+        .list_peers()
+        .map_err(|error| format!("trust list failed: {error}"))?;
+    if peers.is_empty() {
+        return Err("当前没有已配对设备，请先从托盘选择“配对新设备”".to_owned());
+    }
+    let previous = AppSettings::load(&store).ok();
+    println!("ClipFerry 局域网连接设置\n");
+    println!("本机指纹：{}", identity.identity.fingerprint());
+    println!("请选择唯一的活动目标设备：");
+    for (index, peer) in peers.iter().enumerate() {
+        let marker = if previous
+            .as_ref()
+            .is_some_and(|settings| settings.active_peer == peer.fingerprint)
+        {
+            "（当前）"
+        } else {
+            ""
+        };
+        println!(
+            "[{}] {} {}\n    {}",
+            index + 1,
+            peer.label,
+            marker,
+            peer.fingerprint
+        );
+    }
+    let default_selection = previous
+        .as_ref()
+        .and_then(|settings| {
+            peers
+                .iter()
+                .position(|peer| peer.fingerprint == settings.active_peer)
+        })
+        .map_or(1, |index| index + 1);
+    let selection = prompt_with_default("设备编号", &default_selection.to_string())?
+        .parse::<usize>()
+        .map_err(|_| "设备编号必须是数字".to_owned())?;
+    let peer = peers
+        .get(selection.saturating_sub(1))
+        .ok_or_else(|| "设备编号超出范围".to_owned())?;
+
+    println!("\n每台电脑需要一个固定服务地址，建议端口 45233。");
+    println!("本机地址填写本机真实局域网 IPv4；对端地址填写另一台电脑的地址。");
+    let local_default = previous.as_ref().map_or_else(
+        || "192.168.1.2:45233".to_owned(),
+        |value| value.local_endpoint.to_string(),
+    );
+    let local_text = prompt_with_default("本机服务地址", &local_default)?;
+    let local_endpoint = parse_private_socket_text(&local_text, "本机服务地址")?;
+    let peer_default = previous.as_ref().map_or_else(
+        || "192.168.1.3:45233".to_owned(),
+        |value| value.peer_endpoint.to_string(),
+    );
+    let peer_text = prompt_with_default("对端服务地址", &peer_default)?;
+    let peer_endpoint = parse_private_socket_text(&peer_text, "对端服务地址")?;
+    let auto_default = if previous.as_ref().is_some_and(|value| value.auto_receive) {
+        "YES"
+    } else {
+        "NO"
+    };
+    let auto_receive = match prompt_with_default(
+        "收到该设备的文件清单后自动替换本机文件剪贴板（YES/NO）",
+        auto_default,
+    )?
+    .as_str()
+    {
+        "YES" => true,
+        "NO" => false,
+        _ => return Err("自动接收设置只能输入大写 YES 或 NO".to_owned()),
+    };
+    let settings = AppSettings {
+        local_endpoint,
+        active_peer: peer.fingerprint,
+        peer_endpoint,
+        auto_receive,
+    };
+    settings
+        .save(&store)
+        .map_err(|error| format!("settings save failed: {error}"))?;
+    println!(
+        "\nSETTINGS saved=true peer={:?} local={} remote={} auto_receive={}",
+        peer.label, local_endpoint, peer_endpoint, auto_receive
+    );
+    let _ = clipferry::tray::reload_existing();
+    Ok(())
+}
+
+fn run_settings_show() -> Result<(), String> {
+    let store = DeviceStore::current_user()
+        .map_err(|error| format!("device store unavailable: {error}"))?;
+    let settings = AppSettings::load(&store)
+        .map_err(|error| format!("connection settings unavailable: {error}"))?;
+    let peer = store
+        .load_peer(settings.active_peer)
+        .map_err(|error| format!("active peer unavailable: {error}"))?;
+    println!(
+        "SETTINGS peer={:?} fingerprint={} local={} remote={} auto_receive={}",
+        peer.label,
+        peer.fingerprint,
+        settings.local_endpoint,
+        settings.peer_endpoint,
+        settings.auto_receive
+    );
     Ok(())
 }
 
@@ -409,6 +536,20 @@ fn prompt(message: &str) -> Result<String, String> {
         .read_line(&mut value)
         .map_err(|error| format!("console input failed: {error}"))?;
     Ok(value.trim().to_owned())
+}
+
+fn prompt_with_default(label: &str, default: &str) -> Result<String, String> {
+    let value = prompt(&format!("{label} [{default}]: "))?;
+    Ok(if value.is_empty() {
+        default.to_owned()
+    } else {
+        value
+    })
+}
+
+fn parse_private_socket_text(value: &str, label: &str) -> Result<std::net::SocketAddr, String> {
+    let mut values = std::iter::once(value.to_owned());
+    parse_private_socket(&mut values, label)
 }
 
 fn wait_for_enter(message: &str) -> Result<(), String> {
@@ -719,6 +860,7 @@ fn confirm_pairing(pending: PendingPairing, label: &str) -> Result<(), String> {
         "PAIRED completed=true fingerprint={} label={:?}",
         peer.fingerprint, peer.label
     );
+    let _ = clipferry::tray::reload_existing();
     Ok(())
 }
 

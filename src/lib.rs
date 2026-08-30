@@ -1,3 +1,4 @@
+pub mod app_settings;
 pub mod clipboard;
 pub mod device_store;
 pub mod pairing;

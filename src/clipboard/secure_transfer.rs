@@ -2139,6 +2139,16 @@ pub struct TransferGroupStatus {
     pub remote_acknowledged: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferLocalProgress {
+    pub started_transfers: usize,
+    pub completed_transfers: usize,
+    pub read_calls: u64,
+    pub bytes_read: u64,
+    pub paused: bool,
+    pub cancelled: bool,
+}
+
 impl RemoteTransferRegistry {
     /// Creates and remembers a source for the first ordinary file in a validated manifest.
     ///
@@ -2192,6 +2202,32 @@ impl RemoteTransferRegistry {
             }
         }
         source
+    }
+
+    /// Returns a non-blocking process-local progress snapshot without issuing a network request.
+    #[must_use]
+    pub fn local_progress(&self) -> TransferLocalProgress {
+        let Ok(sources) = self.sources.lock() else {
+            return TransferLocalProgress {
+                started_transfers: 0,
+                completed_transfers: 0,
+                read_calls: 0,
+                bytes_read: 0,
+                paused: self.group_paused.load(Ordering::Acquire),
+                cancelled: self.group_cancelled.load(Ordering::Acquire),
+            };
+        };
+        TransferLocalProgress {
+            started_transfers: sources.iter().filter(|source| source.has_started()).count(),
+            completed_transfers: sources
+                .iter()
+                .filter(|source| source.completion_sent.load(Ordering::Acquire))
+                .count(),
+            read_calls: sources.iter().map(|source| source.read_calls()).sum(),
+            bytes_read: sources.iter().map(|source| source.bytes_read()).sum(),
+            paused: self.group_paused.load(Ordering::Acquire),
+            cancelled: self.group_cancelled.load(Ordering::Acquire),
+        }
     }
 
     /// Returns the newest live source that has actually begun a transfer.

@@ -3,6 +3,7 @@ mod format_enum;
 mod local_file;
 mod loopback;
 mod probe;
+mod product;
 mod runtime;
 pub mod secure_transfer;
 mod source;
@@ -10,6 +11,10 @@ mod stream;
 mod transfer;
 
 pub use probe::ProbeState;
+pub use product::{
+    ProductCommand, ProductManifestSummary, ProductRuntime, ProductSnapshot,
+    ProductTransferSnapshot, ProductTransferState,
+};
 pub use runtime::{
     ClipboardProbeOptions, FileCaptureProbeOptions, LoopbackProbeOptions, PauseProbeOptions,
     SecureFetchProbeOptions, SecureFetchResult, SecureReceiverProbeOptions,

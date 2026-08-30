@@ -355,7 +355,7 @@ impl Drop for CapturedClipboardLease {
     }
 }
 
-fn ole_set_clipboard_with_retry(object: &IDataObject) -> Result<()> {
+pub(crate) fn ole_set_clipboard_with_retry(object: &IDataObject) -> Result<()> {
     const BACKOFF: [Duration; 8] = [
         Duration::from_millis(5),
         Duration::from_millis(10),
