@@ -1,11 +1,10 @@
+use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{
@@ -18,7 +17,7 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyW, RegDeleteValueW,
     RegGetValueW, RegSetValueExW,
 };
-use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CreateMutexW};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     ShellExecuteW,
@@ -401,10 +400,27 @@ impl TrayState {
 
     fn spawn_console(command: &str) -> io::Result<()> {
         let executable = std::env::current_exe()?;
-        Command::new(executable)
-            .arg(command)
-            .creation_flags(CREATE_NEW_CONSOLE.0)
-            .spawn()?;
+        let executable = wide_null(executable.as_os_str());
+        let parameters = wide_null(OsStr::new(command));
+        // SAFETY: both strings are null terminated and ShellExecuteW copies them before return.
+        // A console-subsystem child launched from this detached tray receives a fresh console
+        // without the unsupported CREATE_NEW_CONSOLE path observed on some Windows systems.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(executable.as_ptr()),
+                PCWSTR(parameters.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            return Err(io::Error::other(format!(
+                "Windows 无法启动控制台向导（ShellExecute={}）",
+                result.0 as isize
+            )));
+        }
         Ok(())
     }
 
