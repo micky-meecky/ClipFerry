@@ -23,8 +23,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
-    ShellExecuteW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHCNE_UPDATEITEM,
+    SHCNF_FLUSH, SHCNF_PATHW, SHChangeNotify, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
@@ -58,6 +58,7 @@ const SINGLE_INSTANCE_NAME: PCWSTR = w!("Local\\ClipFerry.Tray.v1");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("ClipFerry");
 const ICON_BYTES: &[u8] = include_bytes!("../assets/brand/clipferry.ico");
+const SHELL_MAX_PATH: usize = 260;
 
 const COMMAND_STATUS: usize = 1001;
 const COMMAND_PAIR: usize = 1002;
@@ -70,6 +71,35 @@ const COMMAND_LOG: usize = 1008;
 const COMMAND_EXIT: usize = 1009;
 const COMMAND_SETTINGS: usize = 1010;
 const COMMAND_ACCEPT_PENDING: usize = 1011;
+
+/// Notifies Windows Shell that the running executable changed in place.
+///
+/// This targets the current executable rather than clearing the system-wide icon cache. It lets
+/// Desktop and File Explorer discard a stale icon after a portable same-name upgrade.
+pub fn notify_shell_current_executable_updated() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let wide_path: Vec<u16> = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if wide_path.len() > SHELL_MAX_PATH {
+        return;
+    }
+
+    // SAFETY: `wide_path` is a live, null-terminated absolute UTF-16 path. SHCNF_FLUSH keeps the
+    // call synchronous until interested Shell components receive the targeted item update.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_UPDATEITEM,
+            SHCNF_PATHW | SHCNF_FLUSH,
+            Some(wide_path.as_ptr().cast()),
+            None,
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutostartState {

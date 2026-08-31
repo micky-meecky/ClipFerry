@@ -19,6 +19,7 @@ use clipferry::security::{
 };
 
 fn main() -> ExitCode {
+    clipferry::tray::notify_shell_current_executable_updated();
     if std::env::args_os().len() == 1 {
         return run_tray(true);
     }

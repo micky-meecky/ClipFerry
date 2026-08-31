@@ -1,3 +1,39 @@
+#include <windows.h>
+#include "clipferry-version.h"
+
 #define IDI_CLIPFERRY 1
 
 IDI_CLIPFERRY ICON "assets\\brand\\clipferry.ico"
+
+1 VERSIONINFO
+FILEVERSION CLIPFERRY_VERSION
+PRODUCTVERSION CLIPFERRY_VERSION
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS VS_FF_DEBUG
+#else
+FILEFLAGS 0x0L
+#endif
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "ClipFerry contributors\0"
+            VALUE "FileDescription", "ClipFerry native LAN file clipboard\0"
+            VALUE "FileVersion", CLIPFERRY_VERSION_STRING
+            VALUE "InternalName", "clipferry\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 ClipFerry contributors\0"
+            VALUE "OriginalFilename", "clipferry.exe\0"
+            VALUE "ProductName", "ClipFerry\0"
+            VALUE "ProductVersion", CLIPFERRY_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
