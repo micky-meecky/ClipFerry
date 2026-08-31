@@ -6,6 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+use windows::Win32::NetworkManagement::IpHelper::{
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+    IP_ADAPTER_ADDRESSES_LH,
+};
+use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
 use crate::app_settings::AppSettings;
 use crate::device_store::DeviceStore;
 use crate::security::CertificateFingerprint;
@@ -243,14 +251,15 @@ fn discovery_loop(
     let response = Packet::new(RESPONSE, fingerprint, label)
         .encode()
         .expect("local discovery packet must be valid");
-    let broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
     let mut last_announcement = Instant::now()
         .checked_sub(ANNOUNCE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut buffer = [0_u8; PACKET_LIMIT + 1];
     while !stop.load(Ordering::Acquire) {
         if last_announcement.elapsed() >= ANNOUNCE_INTERVAL {
-            let _ = socket.send_to(&announcement, broadcast);
+            for target in discovery_broadcast_targets() {
+                let _ = socket.send_to(&announcement, target);
+            }
             last_announcement = Instant::now();
         }
         match socket.recv_from(&mut buffer) {
@@ -288,6 +297,99 @@ fn discovery_loop(
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }
+}
+
+fn discovery_broadcast_targets() -> Vec<SocketAddr> {
+    let mut targets = local_private_ipv4_interfaces()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(address, prefix_length)| directed_broadcast(address, prefix_length))
+        .map(|address| SocketAddr::from((address, DISCOVERY_PORT)))
+        .collect::<Vec<_>>();
+    targets.push(SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT)));
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn directed_broadcast(address: Ipv4Addr, prefix_length: u8) -> Option<Ipv4Addr> {
+    if !address.is_private() || prefix_length > 30 {
+        return None;
+    }
+    let mask = u32::MAX.checked_shl(u32::from(32 - prefix_length))?;
+    Some(Ipv4Addr::from(u32::from(address) | !mask))
+}
+
+fn local_private_ipv4_interfaces() -> io::Result<Vec<(Ipv4Addr, u8)>> {
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut byte_length = 15_000_u32;
+    loop {
+        let word_length = usize::try_from(byte_length)
+            .map_err(|_| invalid_data("adapter address buffer is too large"))?
+            .div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; word_length];
+        // SAFETY: the buffer is writable, pointer-aligned, and remains alive while Windows fills
+        // and links the adapter records contained within it.
+        let result = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_INET.0),
+                flags,
+                None,
+                Some(buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &raw mut byte_length,
+            )
+        };
+        if result == ERROR_BUFFER_OVERFLOW.0 {
+            continue;
+        }
+        if result != NO_ERROR.0 {
+            return Err(io::Error::from_raw_os_error(
+                i32::try_from(result).unwrap_or(i32::MAX),
+            ));
+        }
+        // SAFETY: a successful GetAdaptersAddresses call initialized a linked list entirely
+        // inside `buffer`; it stays allocated for the full traversal.
+        return Ok(unsafe {
+            collect_private_ipv4_interfaces(buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>())
+        });
+    }
+}
+
+unsafe fn collect_private_ipv4_interfaces(
+    mut adapter: *const IP_ADAPTER_ADDRESSES_LH,
+) -> Vec<(Ipv4Addr, u8)> {
+    let mut interfaces = Vec::new();
+    while let Some(current) = unsafe { adapter.as_ref() } {
+        if current.OperStatus == IfOperStatusUp {
+            let mut unicast = current.FirstUnicastAddress.cast_const();
+            while let Some(address) = unsafe { unicast.as_ref() } {
+                let socket_address = address.Address;
+                if socket_address.iSockaddrLength
+                    >= i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(i32::MAX)
+                    && !socket_address.lpSockaddr.is_null()
+                {
+                    // SAFETY: the length check above establishes a complete SOCKADDR_IN, and
+                    // GetAdaptersAddresses guarantees the pointer lives in the returned buffer.
+                    let ipv4 = unsafe {
+                        std::ptr::read_unaligned(socket_address.lpSockaddr.cast::<SOCKADDR_IN>())
+                    };
+                    if ipv4.sin_family == AF_INET {
+                        // SAFETY: AF_INET makes the IPv4 byte view of IN_ADDR active.
+                        let bytes = unsafe { ipv4.sin_addr.S_un.S_un_b };
+                        let value = Ipv4Addr::new(bytes.s_b1, bytes.s_b2, bytes.s_b3, bytes.s_b4);
+                        if value.is_private() && address.OnLinkPrefixLength <= 32 {
+                            interfaces.push((value, address.OnLinkPrefixLength));
+                        }
+                    }
+                }
+                unicast = address.Next.cast_const();
+            }
+        }
+        adapter = current.Next.cast_const();
+    }
+    interfaces.sort_unstable();
+    interfaces.dedup();
+    interfaces
 }
 
 fn reconcile_trusted_endpoint(store: &DeviceStore, peer: &DiscoveredPeer) {
@@ -424,5 +526,30 @@ mod tests {
         assert!(is_private_or_loopback("127.0.0.1".parse().unwrap()));
         assert!(is_private_or_loopback("192.168.1.2".parse().unwrap()));
         assert!(!is_private_or_loopback("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn directed_broadcast_uses_each_interface_prefix() {
+        assert_eq!(
+            directed_broadcast("192.168.137.1".parse().unwrap(), 24),
+            Some("192.168.137.255".parse().unwrap())
+        );
+        assert_eq!(
+            directed_broadcast("172.20.144.1".parse().unwrap(), 20),
+            Some("172.20.159.255".parse().unwrap())
+        );
+        assert_eq!(directed_broadcast("8.8.8.8".parse().unwrap(), 24), None);
+        assert_eq!(
+            directed_broadcast("192.168.137.1".parse().unwrap(), 31),
+            None
+        );
+    }
+
+    #[test]
+    fn adapter_enumeration_returns_only_usable_private_ipv4_addresses() {
+        for (address, prefix_length) in local_private_ipv4_interfaces().unwrap() {
+            assert!(address.is_private());
+            assert!(prefix_length <= 32);
+        }
     }
 }
