@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, S_OK, WPARAM};
 use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, RemoveClipboardFormatListener,
+    AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleSetClipboard, OleUninitialize};
@@ -96,8 +96,15 @@ pub struct ProductTransferSnapshot {
     pub transferred: u64,
     pub total_size: u64,
     pub bytes_per_second: u64,
+    pub average_bytes_per_second: u64,
     pub started_files: usize,
     pub total_files: usize,
+    pub current_file_name: Option<String>,
+    pub current_file_transferred: u64,
+    pub current_file_size: u64,
+    pub reconnect_attempts: u64,
+    pub recovered_commands: u64,
+    pub recovery_active: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +117,7 @@ pub struct ProductSnapshot {
     pub pending_offer: bool,
     pub last_manifest: Option<ProductManifestSummary>,
     pub transfer: Option<ProductTransferSnapshot>,
+    pub transfer_generation: u64,
     pub last_error: Option<String>,
 }
 
@@ -124,6 +132,7 @@ impl ProductSnapshot {
             pending_offer: false,
             last_manifest: None,
             transfer: None,
+            transfer_generation: 0,
             last_error: None,
         }
     }
@@ -430,10 +439,12 @@ struct ProductSession {
     pending: Option<OfferAnnouncement>,
     remote: Option<ProductRemoteLease>,
     active_direction: Option<TransferDirection>,
-    last_local_sequence: Option<u32>,
+    last_clipboard_sequence: Option<u32>,
     log_path: std::path::PathBuf,
     last_sample_at: Instant,
     last_sample_bytes: u64,
+    smoothed_speed: u64,
+    transfer_started_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,6 +455,13 @@ enum TransferDirection {
 
 impl ProductSession {
     fn handle_clipboard_update(&mut self, window: HWND) {
+        // SAFETY: this reads the process-wide clipboard sequence without taking ownership.
+        let observed_sequence = unsafe { GetClipboardSequenceNumber() };
+        // Claim the notification before any clipboard read. Successful captures, explicit policy
+        // rejections, and transient read failures must all be deduplicated uniformly.
+        if !claim_clipboard_sequence(&mut self.last_clipboard_sequence, observed_sequence) {
+            return;
+        }
         if self
             .remote
             .as_ref()
@@ -453,16 +471,15 @@ impl ProductSession {
         }
         match capture_files_from_clipboard(window, self.formats) {
             Ok(ClipboardCapture::Candidates { paths, sequence }) => {
-                if self.last_local_sequence == Some(sequence) {
-                    return;
+                if sequence != 0 {
+                    self.last_clipboard_sequence = Some(sequence);
                 }
-                self.last_local_sequence = Some(sequence);
                 if let Err(error) = self.publish_paths(&paths) {
                     self.set_error(format!("本机文件清单发布失败：{error}"));
                 }
             }
             Ok(ClipboardCapture::Rejected(reason)) => {
-                self.set_error(format!("本机文件剪贴板已拒绝：{reason}"));
+                self.set_error(format!("本机文件剪贴板未发送：{}", reason.user_message()));
             }
             Ok(ClipboardCapture::NotFileClipboard | ClipboardCapture::PrivateOffer) => {}
             Err(error) => self.set_error(format!("读取本机剪贴板失败：{error}")),
@@ -513,18 +530,28 @@ impl ProductSession {
         );
         self.update_snapshot(|snapshot| {
             snapshot.last_manifest = Some(summary);
+            snapshot.transfer_generation = snapshot.transfer_generation.wrapping_add(1);
             snapshot.transfer = Some(ProductTransferSnapshot {
                 state: ProductTransferState::AwaitingPaste,
                 transferred: 0,
                 total_size,
                 bytes_per_second: 0,
+                average_bytes_per_second: 0,
                 started_files: 0,
                 total_files,
+                current_file_name: None,
+                current_file_transferred: 0,
+                current_file_size: 0,
+                reconnect_attempts: 0,
+                recovered_commands: 0,
+                recovery_active: false,
             });
             snapshot.last_error = None;
         });
         self.last_sample_at = Instant::now();
         self.last_sample_bytes = 0;
+        self.smoothed_speed = 0;
+        self.transfer_started_at = None;
         self.spawn_announcement(endpoint)?;
         Ok(())
     }
@@ -607,16 +634,26 @@ impl ProductSession {
         self.pending = None;
         self.last_sample_at = Instant::now();
         self.last_sample_bytes = 0;
+        self.smoothed_speed = 0;
+        self.transfer_started_at = None;
         self.update_snapshot(|snapshot| {
             snapshot.pending_offer = false;
             snapshot.last_manifest = Some(summary);
+            snapshot.transfer_generation = snapshot.transfer_generation.wrapping_add(1);
             snapshot.transfer = Some(ProductTransferSnapshot {
                 state: ProductTransferState::AwaitingPaste,
                 transferred: 0,
                 total_size,
                 bytes_per_second: 0,
+                average_bytes_per_second: 0,
                 started_files: 0,
                 total_files,
+                current_file_name: None,
+                current_file_transferred: 0,
+                current_file_size: 0,
+                reconnect_attempts: 0,
+                recovered_commands: 0,
+                recovery_active: false,
             });
             snapshot.last_error = None;
         });
@@ -657,6 +694,7 @@ impl ProductSession {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn refresh_progress(&mut self) {
         if self.active_direction.is_none() {
             return;
@@ -667,6 +705,12 @@ impl ProductSession {
         let mut started_files = 0_usize;
         let mut total_files = 0_usize;
         let mut total_size = 0_u64;
+        let mut current_file_name = None;
+        let mut current_file_transferred = 0_u64;
+        let mut current_file_size = 0_u64;
+        let mut reconnect_attempts = 0_u64;
+        let mut recovered_commands = 0_u64;
+        let mut recovery_active = false;
         if self.active_direction == Some(TransferDirection::Remote)
             && let Some(remote) = self.remote.as_ref()
         {
@@ -676,6 +720,15 @@ impl ProductSession {
             started_files = progress.started_transfers;
             total_files = summary.files;
             total_size = summary.total_size;
+            if let Some((name, transferred, size)) = remote.registry.current_file_progress() {
+                current_file_name = Some(name);
+                current_file_transferred = transferred;
+                current_file_size = size;
+            }
+            let recovery = remote.registry.recovery_snapshot();
+            reconnect_attempts = recovery.reconnect_attempts;
+            recovered_commands = recovery.recovered_commands;
+            recovery_active = recovery.active_recoveries != 0;
             state = if progress.cancelled {
                 ProductTransferState::Cancelled
             } else if progress.paused {
@@ -707,12 +760,36 @@ impl ProductSession {
             };
         }
         let elapsed = now.saturating_duration_since(self.last_sample_at);
-        let speed = if elapsed.is_zero() || bytes < self.last_sample_bytes {
+        let raw_speed = if elapsed.is_zero() || bytes < self.last_sample_bytes {
             0
         } else {
             let scaled = u128::from(bytes - self.last_sample_bytes).saturating_mul(1000)
                 / elapsed.as_millis().max(1);
             u64::try_from(scaled).unwrap_or(u64::MAX)
+        };
+        if state == ProductTransferState::Running && bytes != 0 {
+            self.transfer_started_at.get_or_insert(self.last_sample_at);
+            if raw_speed != 0 {
+                self.smoothed_speed = if self.smoothed_speed == 0 {
+                    raw_speed
+                } else {
+                    self.smoothed_speed
+                        .saturating_mul(3)
+                        .saturating_add(raw_speed)
+                        / 4
+                };
+            }
+        } else if state != ProductTransferState::Paused {
+            self.smoothed_speed = 0;
+        }
+        let average_speed = self.transfer_started_at.map_or(0, |started_at| {
+            let milliseconds = now.saturating_duration_since(started_at).as_millis().max(1);
+            u64::try_from(u128::from(bytes).saturating_mul(1000) / milliseconds).unwrap_or(u64::MAX)
+        });
+        let speed = if state == ProductTransferState::Running {
+            self.smoothed_speed
+        } else {
+            0
         };
         self.last_sample_at = now;
         self.last_sample_bytes = bytes;
@@ -723,8 +800,15 @@ impl ProductSession {
                     transferred: bytes,
                     total_size,
                     bytes_per_second: speed,
+                    average_bytes_per_second: average_speed,
                     started_files,
                     total_files,
+                    current_file_name,
+                    current_file_transferred,
+                    current_file_size,
+                    reconnect_attempts,
+                    recovered_commands,
+                    recovery_active,
                 });
             }
         });
@@ -742,6 +826,17 @@ impl ProductSession {
             Err(mut poisoned) => update(poisoned.get_mut()),
         }
     }
+}
+
+fn claim_clipboard_sequence(last_sequence: &mut Option<u32>, observed_sequence: u32) -> bool {
+    if observed_sequence == 0 {
+        return true;
+    }
+    if *last_sequence == Some(observed_sequence) {
+        return false;
+    }
+    *last_sequence = Some(observed_sequence);
+    true
 }
 
 fn run_worker(
@@ -789,10 +884,12 @@ fn run_worker(
         pending: None,
         remote: None,
         active_direction: None,
-        last_local_sequence: None,
+        last_clipboard_sequence: None,
         log_path: log_path.clone(),
         last_sample_at: Instant::now(),
         last_sample_bytes: 0,
+        smoothed_speed: 0,
+        transfer_started_at: None,
     };
     let mut stopping = false;
     while !stopping {
@@ -1180,6 +1277,17 @@ mod tests {
     #[test]
     fn public_snapshot_layout_stays_small() {
         assert!(std::mem::size_of::<ProductSnapshot>() < 512);
+    }
+
+    #[test]
+    fn clipboard_sequence_is_claimed_before_success_rejection_or_read_failure() {
+        let mut last = None;
+        assert!(claim_clipboard_sequence(&mut last, 41));
+        assert_eq!(last, Some(41));
+        assert!(!claim_clipboard_sequence(&mut last, 41));
+        assert!(claim_clipboard_sequence(&mut last, 42));
+        assert_eq!(last, Some(42));
+        assert!(claim_clipboard_sequence(&mut last, 0));
     }
 
     #[test]

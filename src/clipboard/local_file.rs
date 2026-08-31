@@ -93,6 +93,32 @@ pub enum CaptureRejection {
     NonDiskFile,
 }
 
+impl CaptureRejection {
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::MissingCopyEffect => {
+                "剪贴板来源没有标明这是“复制”还是“剪切”。为避免误操作，ClipFerry 未发送；请在文件资源管理器中使用 Ctrl+C 后重试。"
+            }
+            Self::CutOperation => "检测到剪切操作。ClipFerry 只发送复制的文件，请改用 Ctrl+C。",
+            Self::TooManyItems => "一次选择的项目过多，请减少项目数量后重试。",
+            Self::TreeTooDeep => "文件夹层级过深，无法安全生成传输清单。",
+            Self::ManifestTooLarge => "文件清单过大，无法安全传输。",
+            Self::InvalidPath => "剪贴板中包含无效或不完整的文件路径。",
+            Self::NonUnicodeName => "文件名无法用 Windows Unicode 路径表示。",
+            Self::Directory => "当前操作不支持直接读取这个目录。",
+            Self::ReparsePoint => "所选内容包含符号链接、联接点或其他重解析点。",
+            Self::Encrypted => "所选内容包含 EFS 加密文件。",
+            Self::Sparse => "所选内容包含稀疏文件。",
+            Self::OfflinePlaceholder => "所选内容包含脱机或仅联机的云占位文件。",
+            Self::Compressed => "所选内容包含当前策略不支持的压缩文件。",
+            Self::AlternateDataStream => "所选内容包含 NTFS 附加数据流。",
+            Self::UnsupportedMetadata => "所选内容包含当前无法安全保留的文件元数据。",
+            Self::NonDiskFile => "所选内容不是本机磁盘上的普通文件。",
+        }
+    }
+}
+
 impl fmt::Display for CaptureRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
@@ -1240,6 +1266,14 @@ mod tests {
             validate_drop_effect(0),
             Err(CaptureRejection::MissingCopyEffect)
         );
+    }
+
+    #[test]
+    fn clipboard_rejections_have_actionable_chinese_messages() {
+        let message = CaptureRejection::MissingCopyEffect.user_message();
+        assert!(message.contains("复制"));
+        assert!(message.contains("Ctrl+C"));
+        assert!(!message.contains("missing-copy-effect"));
     }
 
     #[test]

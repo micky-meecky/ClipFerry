@@ -23,30 +23,31 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHCNE_ASSOCCHANGED,
-    SHCNE_UPDATEITEM, SHCNF_FLUSH, SHCNF_IDLIST, SHCNF_PATHW, SHChangeNotify, Shell_NotifyIconW,
-    ShellExecuteW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    SHCNE_ASSOCCHANGED, SHCNE_UPDATEITEM, SHCNF_FLUSH, SHCNF_IDLIST, SHCNF_PATHW, SHChangeNotify,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW,
     GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HICON,
-    HWND_MESSAGE, IDI_APPLICATION, IDYES, LR_DEFAULTCOLOR, LoadIconW, MB_ICONERROR,
+    HWND_MESSAGE, IDI_APPLICATION, IDYES, KillTimer, LR_DEFAULTCOLOR, LoadIconW, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_YESNO, MENU_ITEM_FLAGS,
     MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
-    SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_QUERYENDSESSION,
-    WM_RBUTTONUP, WNDCLASSW,
+    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windows_core::{PCWSTR, w};
 
 use crate::app_settings::AppSettings;
-use crate::clipboard::{ProductCommand, ProductRuntime, ProductTransferState};
+use crate::clipboard::{ProductCommand, ProductRuntime, ProductSnapshot, ProductTransferState};
 use crate::device_store::DeviceStore;
 use crate::discovery::{DiscoveryRuntime, DiscoveryView, PAIRING_PORT, activate_discovered_peer};
 use crate::pairing::{PendingPairing, connect_for_pairing, listen_for_pairing};
+use crate::transfer_window::{TransferWindow, TransferWindowCommands};
 
 const TRAY_WINDOW_CLASS: PCWSTR = w!("ClipFerryTrayWindow");
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
@@ -55,6 +56,8 @@ const TRAY_EXIT_MESSAGE: u32 = WM_APP + 3;
 const TRAY_RELOAD_MESSAGE: u32 = WM_APP + 4;
 const TRAY_RUNTIME_ERROR_MESSAGE: u32 = WM_APP + 5;
 const TRAY_ICON_ID: u32 = 1;
+const TRAY_REFRESH_TIMER_ID: usize = 0x4346_5452;
+const TRAY_REFRESH_TIMER_MS: u32 = 500;
 const SINGLE_INSTANCE_NAME: PCWSTR = w!("Local\\ClipFerry.Tray.v1");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("ClipFerry");
@@ -72,6 +75,7 @@ const COMMAND_LOG: usize = 1008;
 const COMMAND_EXIT: usize = 1009;
 const COMMAND_SETTINGS: usize = 1010;
 const COMMAND_ACCEPT_PENDING: usize = 1011;
+const COMMAND_TRANSFER_WINDOW: usize = 1012;
 
 /// Notifies Windows Shell that the running executable changed in place.
 ///
@@ -382,6 +386,9 @@ struct TrayState {
     pairing: Option<PairingRuntime>,
     runtime: Option<ProductRuntime>,
     runtime_error: Option<String>,
+    transfer_window: Option<TransferWindow>,
+    transfer_window_error: Option<String>,
+    last_tooltip: String,
 }
 
 impl TrayState {
@@ -425,6 +432,9 @@ impl TrayState {
             pairing,
             runtime,
             runtime_error,
+            transfer_window: None,
+            transfer_window_error: None,
+            last_tooltip: String::new(),
         })
     }
 
@@ -546,7 +556,7 @@ impl TrayState {
     }
 
     fn add_icon(&self, window: HWND) -> io::Result<()> {
-        let data = self.notify_data(window);
+        let data = self.notify_data(window, &self.tooltip_text());
         // SAFETY: data is fully initialized and references a live hidden window and icon.
         if unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) }.as_bool() {
             Ok(())
@@ -556,12 +566,12 @@ impl TrayState {
     }
 
     fn delete_icon(&self, window: HWND) {
-        let data = self.notify_data(window);
+        let data = self.notify_data(window, "");
         // SAFETY: deleting a missing icon is harmless; the data identifies our own tray icon.
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &raw const data) };
     }
 
-    fn notify_data(&self, window: HWND) -> NOTIFYICONDATAW {
+    fn notify_data(&self, window: HWND, tooltip: &str) -> NOTIFYICONDATAW {
         let mut data = NOTIFYICONDATAW {
             cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>()).unwrap_or(u32::MAX),
             hWnd: window,
@@ -571,8 +581,119 @@ impl TrayState {
             hIcon: self.icon.handle,
             ..Default::default()
         };
-        copy_wide_to_fixed("ClipFerry · 剪贴摆渡", &mut data.szTip);
+        copy_wide_to_fixed(tooltip, &mut data.szTip);
         data
+    }
+
+    fn tooltip_text(&self) -> String {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return self.runtime_error.as_ref().map_or_else(
+                || "ClipFerry · 尚未配置".to_owned(),
+                |error| format!("ClipFerry · 后台服务未启动\r\n{}", truncate_text(error, 72)),
+            );
+        };
+        let snapshot = runtime.snapshot();
+        if let (Some(manifest), Some(transfer)) =
+            (snapshot.last_manifest.as_ref(), snapshot.transfer.as_ref())
+        {
+            let tenths = transfer_percentage_tenths(transfer.transferred, transfer.total_size);
+            return format!(
+                "ClipFerry · {} {}.{}%\r\n{}/s · {} / {}\r\n{} · {}",
+                manifest.direction,
+                tenths / 10,
+                tenths % 10,
+                format_bytes(transfer.bytes_per_second),
+                format_bytes(transfer.transferred),
+                format_bytes(transfer.total_size),
+                truncate_text(&snapshot.active_peer_label, 24),
+                transfer.state.label()
+            );
+        }
+        format!(
+            "ClipFerry · {}在线\r\n自动接收{} · 暂无传输",
+            truncate_text(&snapshot.active_peer_label, 36),
+            if snapshot.auto_receive {
+                "开启"
+            } else {
+                "关闭"
+            }
+        )
+    }
+
+    fn update_icon_tip(&mut self, window: HWND) -> io::Result<()> {
+        let tooltip = self.tooltip_text();
+        if tooltip == self.last_tooltip {
+            return Ok(());
+        }
+        let data = self.notify_data(window, &tooltip);
+        // SAFETY: data identifies the live tray icon and contains only owned fixed-size fields.
+        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) }.as_bool() {
+            return Err(io::Error::last_os_error());
+        }
+        self.last_tooltip = tooltip;
+        Ok(())
+    }
+
+    fn ensure_transfer_window(&mut self, command_target: HWND) -> io::Result<&mut TransferWindow> {
+        if self.transfer_window.is_none() {
+            let window = TransferWindow::create(
+                command_target,
+                self.icon.handle,
+                TransferWindowCommands {
+                    pause: COMMAND_PAUSE,
+                    resume: COMMAND_RESUME,
+                    cancel: COMMAND_CANCEL,
+                },
+            )?;
+            self.transfer_window = Some(window);
+        }
+        self.transfer_window
+            .as_mut()
+            .ok_or_else(|| io::Error::other("传输窗口初始化失败"))
+    }
+
+    fn refresh_ui(&mut self, command_target: HWND) {
+        if let Err(error) = self.update_icon_tip(command_target) {
+            let _ = append_log(
+                &self.log_path,
+                &format!("tray_tooltip_update error={error}"),
+            );
+        }
+        let Some(snapshot) = self.runtime.as_ref().map(ProductRuntime::snapshot) else {
+            return;
+        };
+        if !has_receiver_transfer(&snapshot) {
+            return;
+        }
+        match self
+            .ensure_transfer_window(command_target)
+            .and_then(|window| window.update(&snapshot))
+        {
+            Ok(()) => self.transfer_window_error = None,
+            Err(error) => {
+                let message = error.to_string();
+                if self.transfer_window_error.as_deref() != Some(&message) {
+                    let _ = append_log(
+                        &self.log_path,
+                        &format!("transfer_window_update error={error}"),
+                    );
+                    self.transfer_window_error = Some(message);
+                }
+            }
+        }
+    }
+
+    fn show_transfer_window(&mut self, command_target: HWND) -> io::Result<()> {
+        let snapshot = self
+            .runtime
+            .as_ref()
+            .map(ProductRuntime::snapshot)
+            .filter(has_receiver_transfer)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "当前没有接收传输"))?;
+        let window = self.ensure_transfer_window(command_target)?;
+        window.update(&snapshot)?;
+        window.show();
+        Ok(())
     }
 
     fn handle_command(&mut self, window: HWND, command: usize) {
@@ -582,6 +703,7 @@ impl TrayState {
             COMMAND_MANAGE_PEERS => Self::spawn_console("trust-wizard"),
             COMMAND_SETTINGS => Self::spawn_console("settings-wizard"),
             COMMAND_ACCEPT_PENDING => self.product_command(ProductCommand::AcceptPending),
+            COMMAND_TRANSFER_WINDOW => self.show_transfer_window(window),
             COMMAND_PAUSE => self.product_command(ProductCommand::Pause),
             COMMAND_RESUME => self.product_command(ProductCommand::Resume),
             COMMAND_CANCEL => self.product_command(ProductCommand::Cancel),
@@ -779,6 +901,11 @@ impl TrayState {
             enabled_menu_flags(pending),
         )?;
         menu.append(
+            "显示传输窗口",
+            COMMAND_TRANSFER_WINDOW,
+            enabled_menu_flags(product.as_ref().is_some_and(has_receiver_transfer)),
+        )?;
+        menu.append(
             "暂停传输",
             COMMAND_PAUSE,
             enabled_menu_flags(transfer_state == Some(ProductTransferState::Running)),
@@ -853,6 +980,35 @@ fn enabled_menu_flags(enabled: bool) -> MENU_ITEM_FLAGS {
         MF_STRING
     } else {
         MF_STRING | MF_DISABLED
+    }
+}
+
+fn has_receiver_transfer(snapshot: &ProductSnapshot) -> bool {
+    snapshot.transfer.is_some()
+        && snapshot
+            .last_manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.direction == "接收")
+}
+
+fn transfer_percentage_tenths(transferred: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    transferred
+        .min(total)
+        .saturating_mul(1000)
+        .checked_div(total)
+        .unwrap_or_default()
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut characters = text.chars();
+    let prefix = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
@@ -966,6 +1122,22 @@ impl TrayWindow {
             let _ = unsafe { UnregisterClassW(TRAY_WINDOW_CLASS, Some(instance)) };
             return Err(error);
         }
+        // SAFETY: the hidden tray window is live and receives periodic pointer-free WM_TIMER.
+        if unsafe {
+            SetTimer(
+                Some(handle),
+                TRAY_REFRESH_TIMER_ID,
+                TRAY_REFRESH_TIMER_MS,
+                None,
+            )
+        } == 0
+        {
+            state.delete_icon(handle);
+            // SAFETY: handle and class are owned by this partially constructed window.
+            let _ = unsafe { DestroyWindow(handle) };
+            let _ = unsafe { UnregisterClassW(TRAY_WINDOW_CLASS, Some(instance)) };
+            return Err(io::Error::last_os_error());
+        }
         Ok(Self {
             handle,
             instance,
@@ -986,6 +1158,14 @@ impl TrayWindow {
             if result == 0 {
                 return Ok(());
             }
+            if self
+                .state
+                .transfer_window
+                .as_ref()
+                .is_some_and(|window| window.is_dialog_message(&message))
+            {
+                continue;
+            }
             // SAFETY: GetMessageW initialized the message.
             unsafe {
                 let _ = TranslateMessage(&raw const message);
@@ -997,6 +1177,8 @@ impl TrayWindow {
 
 impl Drop for TrayWindow {
     fn drop(&mut self) {
+        // SAFETY: balances the fixed timer created for this live hidden window.
+        let _ = unsafe { KillTimer(Some(self.handle), TRAY_REFRESH_TIMER_ID) };
         self.state.delete_icon(self.handle);
         // SAFETY: the window was created by this guard and state stays live through destruction.
         let _ = unsafe { DestroyWindow(self.handle) };
@@ -1069,6 +1251,10 @@ unsafe extern "system" fn tray_window_procedure(
         }
         if message == TRAY_RUNTIME_ERROR_MESSAGE {
             state.show_runtime_error(window);
+            return LRESULT(0);
+        }
+        if message == WM_TIMER && wparam.0 == TRAY_REFRESH_TIMER_ID {
+            state.refresh_ui(window);
             return LRESULT(0);
         }
         if message == WM_COMMAND {

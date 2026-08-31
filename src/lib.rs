@@ -4,6 +4,7 @@ pub mod device_store;
 pub mod discovery;
 pub mod pairing;
 pub mod security;
+mod transfer_window;
 pub mod tray;
 
 pub const APP_NAME: &str = "ClipFerry";

@@ -1,6 +1,6 @@
 [package]
 name = "clipferry"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A native Windows LAN file clipboard"
@@ -30,6 +30,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.62.2"

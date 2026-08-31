@@ -2230,6 +2230,28 @@ impl RemoteTransferRegistry {
         }
     }
 
+    /// Returns the newest started file and its process-local read progress for presentation.
+    #[must_use]
+    pub fn current_file_progress(&self) -> Option<(String, u64, u64)> {
+        self.sources.lock().ok().and_then(|sources| {
+            sources
+                .iter()
+                .rev()
+                .find(|source| {
+                    source.has_started() && !source.completion_sent.load(Ordering::Acquire)
+                })
+                .or_else(|| sources.iter().rev().find(|source| source.has_started()))
+                .map(|source| {
+                    let size = source.entry.descriptor.size;
+                    (
+                        source.entry.descriptor.file_name.to_string(),
+                        source.bytes_read().min(size),
+                        size,
+                    )
+                })
+        })
+    }
+
     /// Returns the newest live source that has actually begun a transfer.
     ///
     /// # Errors
