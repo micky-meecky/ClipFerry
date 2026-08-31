@@ -1,9 +1,8 @@
-"""Build the transparent Windows application icon from the generated source art."""
+"""Build the two-shape Windows application icon from the generated source art."""
 
-from collections.abc import Iterable
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageFilter
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,43 +10,46 @@ SOURCE = ROOT / "assets" / "brand" / "clipferry-icon-generated.png"
 PNG_OUTPUT = ROOT / "assets" / "brand" / "clipferry-icon-512.png"
 ICO_OUTPUT = ROOT / "assets" / "brand" / "clipferry.ico"
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
-EDGE_COLOR = (1, 13, 62)
-
-
-def content_spans(image: Image.Image, threshold: int = 180) -> Iterable[tuple[int, int, int]]:
-    pixels = image.convert("RGB").load()
-    for y in range(image.height):
-        xs = [x for x in range(image.width) if min(pixels[x, y]) < threshold]
-        if xs:
-            yield y, min(xs), max(xs)
+BACKGROUND_COLOR = (1, 13, 62)
+WHITE_SHAPE_COLOR = (254, 254, 254)
 
 
 def make_transparent_icon(source: Image.Image) -> Image.Image:
-    image = source.convert("RGBA").resize((512, 512), Image.Resampling.LANCZOS)
-    mask = Image.new("L", image.size, 0)
-    mask_pixels = mask.load()
+    image = source.convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+    output = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    source_pixels = image.load()
+    output_pixels = output.load()
 
-    # The generated artwork has a white canvas. Fill between the dark outer
-    # silhouette on every row so white details inside the logo remain opaque.
-    for y, left, right in content_spans(image):
-        for x in range(left, right + 1):
-            mask_pixels[x, y] = 255
+    # Only the white shape on the left and the blue shape on the right belong
+    # to the application icon. The generated white canvas and navy rounded
+    # square are both deliberately discarded.
+    for y in range(80, 432):
+        for x in range(80, 440):
+            red, green, blue = source_pixels[x, y]
+            if x < 264 and red > 12 and green > 20:
+                alpha = (red - BACKGROUND_COLOR[0]) / (
+                    WHITE_SHAPE_COLOR[0] - BACKGROUND_COLOR[0]
+                )
+                alpha = max(0.0, min(1.0, alpha))
+                if alpha > 0.025:
+                    output_pixels[x, y] = (*WHITE_SHAPE_COLOR, round(alpha * 255))
+            elif x >= 264 and green > 20 and blue > 75 and blue > red * 1.25:
+                alpha = (green - BACKGROUND_COLOR[1]) / (123 - BACKGROUND_COLOR[1])
+                alpha = max(0.0, min(1.0, alpha))
+                if alpha <= 0.025:
+                    continue
 
-    # Repaint only the outer edge with the logo's navy color. This avoids a
-    # white fringe from the original canvas when Windows downsamples the icon.
-    eroded = mask.filter(ImageFilter.MinFilter(7))
-    edge = ImageChops.subtract(mask, eroded)
-    edge_pixels = edge.load()
-    output_pixels = image.load()
-    for y in range(image.height):
-        for x in range(image.width):
-            if mask_pixels[x, y] == 0:
-                output_pixels[x, y] = (*EDGE_COLOR, 0)
-            elif edge_pixels[x, y]:
-                output_pixels[x, y] = (*EDGE_COLOR, 255)
+                # Undo the navy-background blend at anti-aliased edge pixels
+                # so the isolated blue shape has no dark fringe.
+                foreground = []
+                for channel, background in zip(
+                    (red, green, blue), BACKGROUND_COLOR, strict=True
+                ):
+                    value = (channel - background * (1 - alpha)) / alpha
+                    foreground.append(max(0, min(255, round(value))))
+                output_pixels[x, y] = (*foreground, round(alpha * 255))
 
-    image.putalpha(mask)
-    return image
+    return output
 
 
 def main() -> None:
