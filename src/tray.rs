@@ -23,8 +23,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHCNE_UPDATEITEM,
-    SHCNF_FLUSH, SHCNF_PATHW, SHChangeNotify, Shell_NotifyIconW, ShellExecuteW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHCNE_ASSOCCHANGED,
+    SHCNE_UPDATEITEM, SHCNF_FLUSH, SHCNF_IDLIST, SHCNF_PATHW, SHChangeNotify, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
@@ -74,8 +75,8 @@ const COMMAND_ACCEPT_PENDING: usize = 1011;
 
 /// Notifies Windows Shell that the running executable changed in place.
 ///
-/// This targets the current executable rather than clearing the system-wide icon cache. It lets
-/// Desktop and File Explorer discard a stale icon after a portable same-name upgrade.
+/// This invalidates Shell's icon cache before targeting the current executable. It lets Desktop
+/// and File Explorer discard a stale system-image-list entry after a portable same-name upgrade.
 pub fn notify_shell_current_executable_updated() {
     let Ok(executable) = std::env::current_exe() else {
         return;
@@ -89,8 +90,15 @@ pub fn notify_shell_current_executable_updated() {
         return;
     }
 
-    // SAFETY: `wide_path` is a live, null-terminated absolute UTF-16 path. SHCNF_FLUSH keeps the
-    // call synchronous until interested Shell components receive the targeted item update.
+    // SAFETY: SHCNE_ASSOCCHANGED takes no item pointers with SHCNF_IDLIST. Microsoft documents it
+    // as the notification that invalidates Shell's icon and thumbnail cache. SHCNF_FLUSH waits
+    // until affected Shell components receive the invalidation.
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None);
+    }
+
+    // SAFETY: `wide_path` is a live, null-terminated absolute UTF-16 path. After invalidating the
+    // cached image, the targeted update makes Desktop and File Explorer reload this exact item.
     unsafe {
         SHChangeNotify(
             SHCNE_UPDATEITEM,
@@ -1094,6 +1102,7 @@ unsafe extern "system" fn tray_window_procedure(
 /// Returns a user-facing error when identity initialization, single-instance acquisition,
 /// hidden-window setup, tray registration, or the message loop fails.
 pub fn run(detach_console: bool) -> Result<(), String> {
+    notify_shell_current_executable_updated();
     if detach_console {
         // SAFETY: detaching the inherited console is process-local and expected for tray mode.
         let _ = unsafe { FreeConsole() };
