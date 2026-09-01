@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DeleteObject, FF_DONTCARE, GetSysColorBrush, HDC, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, SetBkMode, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -20,9 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GetWindowLongPtrW, HICON, HMENU, IDC_ARROW, IsDialogMessageW, IsWindowVisible,
     LoadCursorW, MSG, PostMessageW, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_RESTORE,
     SW_SHOWNOACTIVATE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW,
-    ShowWindow, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_NCCREATE,
-    WM_NCDESTROY, WM_SETFONT, WM_SYSCOMMAND, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ShowWindow, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORSTATIC, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SYSCOMMAND, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows_core::{PCWSTR, w};
 
@@ -44,6 +46,7 @@ struct ProcedureState {
     command_target: HWND,
     commands: TransferWindowCommands,
     hidden_by_user: Arc<AtomicBool>,
+    primary_is_close: Arc<AtomicBool>,
 }
 
 struct Controls {
@@ -64,7 +67,10 @@ pub struct TransferWindow {
     instance: HINSTANCE,
     procedure_state: Box<ProcedureState>,
     controls: Controls,
+    body_font: HFONT,
+    heading_font: HFONT,
     hidden_by_user: Arc<AtomicBool>,
+    primary_is_close: Arc<AtomicBool>,
     generation: Option<u64>,
 }
 
@@ -102,10 +108,12 @@ impl TransferWindow {
             return Err(io::Error::last_os_error());
         }
         let hidden_by_user = Arc::new(AtomicBool::new(false));
+        let primary_is_close = Arc::new(AtomicBool::new(false));
         let mut procedure_state = Box::new(ProcedureState {
             command_target,
             commands,
             hidden_by_user: Arc::clone(&hidden_by_user),
+            primary_is_close: Arc::clone(&primary_is_close),
         });
         let state_pointer = (&raw mut *procedure_state).cast::<c_void>();
         let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
@@ -118,8 +126,8 @@ impl TransferWindow {
                 style,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                620,
-                330,
+                680,
+                370,
                 None,
                 None,
                 Some(instance),
@@ -133,12 +141,31 @@ impl TransferWindow {
                 return Err(windows_error(error));
             }
         };
-        let child_result = Self::create_controls(handle, instance);
+        let body_font = match create_font(-17, 400) {
+            Ok(font) => font,
+            Err(error) => {
+                let _ = unsafe { DestroyWindow(handle) };
+                let _ = unsafe { UnregisterClassW(TRANSFER_WINDOW_CLASS, Some(instance)) };
+                return Err(error);
+            }
+        };
+        let heading_font = match create_font(-21, 600) {
+            Ok(font) => font,
+            Err(error) => {
+                let _ = unsafe { DeleteObject(HGDIOBJ(body_font.0)) };
+                let _ = unsafe { DestroyWindow(handle) };
+                let _ = unsafe { UnregisterClassW(TRANSFER_WINDOW_CLASS, Some(instance)) };
+                return Err(error);
+            }
+        };
+        let child_result = Self::create_controls(handle, instance, body_font, heading_font);
         let child_controls = match child_result {
             Ok(controls) => controls,
             Err(error) => {
                 // SAFETY: the partially initialized top-level window owns all created children.
                 let _ = unsafe { DestroyWindow(handle) };
+                let _ = unsafe { DeleteObject(HGDIOBJ(body_font.0)) };
+                let _ = unsafe { DeleteObject(HGDIOBJ(heading_font.0)) };
                 let _ = unsafe { UnregisterClassW(TRANSFER_WINDOW_CLASS, Some(instance)) };
                 return Err(error);
             }
@@ -148,22 +175,30 @@ impl TransferWindow {
             instance,
             procedure_state,
             controls: child_controls,
+            body_font,
+            heading_font,
             hidden_by_user,
+            primary_is_close,
             generation: None,
         })
     }
 
     #[allow(clippy::too_many_lines)]
-    fn create_controls(parent: HWND, instance: HINSTANCE) -> io::Result<Controls> {
+    fn create_controls(
+        parent: HWND,
+        instance: HINSTANCE,
+        body_font: HFONT,
+        heading_font: HFONT,
+    ) -> io::Result<Controls> {
         let heading = create_child(
             parent,
             instance,
             w!("STATIC"),
             "等待接收文件",
-            20,
-            18,
-            560,
-            24,
+            28,
+            22,
+            624,
+            28,
             0,
         )?;
         let state = create_child(
@@ -171,22 +206,22 @@ impl TransferWindow {
             instance,
             w!("STATIC"),
             "等待传输开始",
-            20,
-            49,
-            560,
-            22,
+            28,
+            58,
+            624,
+            24,
             0,
         )?;
-        let progress = create_child(parent, instance, PROGRESS_CLASSW, "", 20, 78, 560, 22, 0)?;
+        let progress = create_child(parent, instance, PROGRESS_CLASSW, "", 28, 92, 624, 18, 0)?;
         let amount = create_child(
             parent,
             instance,
             w!("STATIC"),
             "0 B / 0 B",
-            20,
-            110,
-            560,
-            22,
+            28,
+            122,
+            624,
+            24,
             0,
         )?;
         let speed = create_child(
@@ -194,10 +229,10 @@ impl TransferWindow {
             instance,
             w!("STATIC"),
             "当前速度：0 B/s",
-            20,
-            137,
-            560,
-            22,
+            28,
+            188,
+            624,
+            24,
             0,
         )?;
         let current_file = create_child(
@@ -205,10 +240,10 @@ impl TransferWindow {
             instance,
             w!("STATIC"),
             "当前文件：尚未开始",
-            20,
-            164,
-            560,
-            22,
+            28,
+            158,
+            624,
+            24,
             0,
         )?;
         let recovery = create_child(
@@ -216,10 +251,10 @@ impl TransferWindow {
             instance,
             w!("STATIC"),
             "网络状态：稳定",
-            20,
-            191,
-            560,
-            22,
+            28,
+            218,
+            624,
+            24,
             0,
         )?;
         let pause = create_child(
@@ -227,10 +262,10 @@ impl TransferWindow {
             instance,
             w!("BUTTON"),
             "暂停",
-            304,
-            228,
-            84,
-            32,
+            352,
+            276,
+            92,
+            34,
             CONTROL_PAUSE,
         )?;
         let resume = create_child(
@@ -238,10 +273,10 @@ impl TransferWindow {
             instance,
             w!("BUTTON"),
             "继续",
-            400,
-            228,
-            84,
-            32,
+            456,
+            276,
+            92,
+            34,
             CONTROL_RESUME,
         )?;
         let cancel = create_child(
@@ -249,16 +284,14 @@ impl TransferWindow {
             instance,
             w!("BUTTON"),
             "取消",
-            496,
-            228,
-            84,
-            32,
+            560,
+            276,
+            92,
+            34,
             CONTROL_CANCEL,
         )?;
-        // SAFETY: DEFAULT_GUI_FONT is a shared stock object; every handle is a live child window.
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        set_control_font(heading, heading_font);
         for control in [
-            heading,
             state,
             amount,
             speed,
@@ -268,14 +301,7 @@ impl TransferWindow {
             resume,
             cancel,
         ] {
-            unsafe {
-                SendMessageW(
-                    control,
-                    WM_SETFONT,
-                    Some(WPARAM(font.0 as usize)),
-                    Some(LPARAM(1)),
-                );
-            }
+            set_control_font(control, body_font);
         }
         // SAFETY: the progress bar is live and accepts a 0..1000 integer range.
         unsafe {
@@ -310,6 +336,13 @@ impl TransferWindow {
         else {
             return Ok(());
         };
+        if !should_present_generation(
+            self.generation,
+            snapshot.transfer_generation,
+            transfer.state,
+        ) {
+            return Ok(());
+        }
         if self.generation != Some(snapshot.transfer_generation) {
             self.generation = Some(snapshot.transfer_generation);
             self.hidden_by_user.store(false, Ordering::Release);
@@ -382,6 +415,21 @@ impl TransferWindow {
             "网络状态：稳定".to_owned()
         };
         set_text(self.controls.recovery, &recovery)?;
+        let terminal = matches!(
+            transfer.state,
+            ProductTransferState::Completed
+                | ProductTransferState::Cancelled
+                | ProductTransferState::Failed
+        );
+        self.primary_is_close.store(terminal, Ordering::Release);
+        set_text(
+            self.controls.cancel,
+            match transfer.state {
+                ProductTransferState::Completed => "完成",
+                ProductTransferState::Cancelled | ProductTransferState::Failed => "关闭",
+                _ => "取消",
+            },
+        )?;
         // SAFETY: the controls are live and the message parameters are bounded integers.
         unsafe {
             SendMessageW(
@@ -409,15 +457,7 @@ impl TransferWindow {
                 self.controls.resume,
                 transfer.state == ProductTransferState::Paused,
             );
-            let _ = EnableWindow(
-                self.controls.cancel,
-                matches!(
-                    transfer.state,
-                    ProductTransferState::AwaitingPaste
-                        | ProductTransferState::Running
-                        | ProductTransferState::Paused
-                ),
-            );
+            let _ = EnableWindow(self.controls.cancel, true);
         }
         if matches!(
             transfer.state,
@@ -452,6 +492,8 @@ impl Drop for TransferWindow {
         let _ = &self.procedure_state;
         // SAFETY: this guard owns the top-level window and registered class.
         let _ = unsafe { DestroyWindow(self.handle) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(self.body_font.0)) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(self.heading_font.0)) };
         let _ = unsafe { UnregisterClassW(TRANSFER_WINDOW_CLASS, Some(self.instance)) };
     }
 }
@@ -479,6 +521,12 @@ unsafe extern "system" fn transfer_window_procedure(
         match message {
             WM_COMMAND => {
                 let control = wparam.0 & 0xffff;
+                if control == CONTROL_CANCEL && state.primary_is_close.load(Ordering::Acquire) {
+                    state.hidden_by_user.store(true, Ordering::Release);
+                    // SAFETY: terminal action only hides the live transfer window.
+                    let _ = unsafe { ShowWindow(window, SW_HIDE) };
+                    return LRESULT(0);
+                }
                 let command = match control {
                     CONTROL_PAUSE => Some(state.commands.pause),
                     CONTROL_RESUME => Some(state.commands.resume),
@@ -495,6 +543,11 @@ unsafe extern "system" fn transfer_window_procedure(
                             LPARAM(0),
                         )
                     };
+                    if control == CONTROL_CANCEL {
+                        state.hidden_by_user.store(true, Ordering::Release);
+                        // SAFETY: cancellation continues in the tray worker after this window hides.
+                        let _ = unsafe { ShowWindow(window, SW_HIDE) };
+                    }
                 }
                 return LRESULT(0);
             }
@@ -515,6 +568,14 @@ unsafe extern "system" fn transfer_window_procedure(
             WM_NCDESTROY => {
                 // SAFETY: the procedure state is no longer read after non-client destruction.
                 unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
+            }
+            WM_CTLCOLORSTATIC => {
+                let device_context = HDC(wparam.0 as *mut c_void);
+                // SAFETY: WM_CTLCOLORSTATIC provides a live device context for this paint pass.
+                let _ = unsafe { SetBkMode(device_context, TRANSPARENT) };
+                // SAFETY: the system color brush is shared and matches the window background.
+                let brush = unsafe { GetSysColorBrush(COLOR_WINDOW) };
+                return LRESULT(brush.0 as isize);
             }
             _ => {}
         }
@@ -567,6 +628,45 @@ fn set_text(window: HWND, text: &str) -> io::Result<()> {
     unsafe { SetWindowTextW(window, PCWSTR(text.as_ptr())) }.map_err(windows_error)
 }
 
+fn create_font(height: i32, weight: i32) -> io::Result<HFONT> {
+    // SAFETY: all scalar parameters are bounded and the face name is a static UTF-16 string.
+    let font = unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+            w!("Segoe UI"),
+        )
+    };
+    if font.0.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(font)
+    }
+}
+
+fn set_control_font(control: HWND, font: HFONT) {
+    // SAFETY: both handles remain live until after the parent window is destroyed.
+    unsafe {
+        SendMessageW(
+            control,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
+}
+
 fn progress_tenths(transferred: u64, total: u64, state: ProductTransferState) -> u16 {
     if total == 0 {
         return u16::from(state == ProductTransferState::Completed) * 1000;
@@ -579,6 +679,16 @@ fn progress_tenths(transferred: u64, total: u64, state: ProductTransferState) ->
             .unwrap_or_default(),
     )
     .unwrap_or(1000)
+}
+
+fn should_present_generation(
+    displayed_generation: Option<u64>,
+    incoming_generation: u64,
+    incoming_state: ProductTransferState,
+) -> bool {
+    displayed_generation.is_none()
+        || displayed_generation == Some(incoming_generation)
+        || incoming_state != ProductTransferState::AwaitingPaste
 }
 
 fn format_remaining(transfer: &crate::clipboard::ProductTransferSnapshot) -> String {
@@ -682,6 +792,25 @@ mod tests {
     fn truncation_preserves_unicode_boundaries() {
         assert_eq!(truncate("你好-ClipFerry", 2), "你好…");
         assert_eq!(truncate("文件", 4), "文件");
+    }
+
+    #[test]
+    fn an_unpasted_offer_does_not_replace_the_visible_transfer_result() {
+        assert!(!should_present_generation(
+            Some(7),
+            8,
+            ProductTransferState::AwaitingPaste
+        ));
+        assert!(should_present_generation(
+            Some(7),
+            8,
+            ProductTransferState::Running
+        ));
+        assert!(should_present_generation(
+            Some(7),
+            7,
+            ProductTransferState::Completed
+        ));
     }
 
     #[test]

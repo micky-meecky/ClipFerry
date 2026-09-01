@@ -593,6 +593,18 @@ impl TrayState {
             );
         };
         let snapshot = runtime.snapshot();
+        let has_active_transfer = snapshot.transfer.as_ref().is_some_and(|transfer| {
+            matches!(
+                transfer.state,
+                ProductTransferState::Running | ProductTransferState::Paused
+            )
+        });
+        if !has_active_transfer && let Some(error) = snapshot.last_error.as_deref() {
+            return format!(
+                "ClipFerry · 最近一次剪贴板未发送\r\n{}",
+                truncate_text(error, 88)
+            );
+        }
         if let (Some(manifest), Some(transfer)) =
             (snapshot.last_manifest.as_ref(), snapshot.transfer.as_ref())
         {

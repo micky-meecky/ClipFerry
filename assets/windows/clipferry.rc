@@ -5,6 +5,8 @@
 
 IDI_CLIPFERRY ICON "assets\\brand\\clipferry.ico"
 
+1 24 "assets\\windows\\clipferry.manifest"
+
 1 VERSIONINFO
 FILEVERSION CLIPFERRY_VERSION
 PRODUCTVERSION CLIPFERRY_VERSION

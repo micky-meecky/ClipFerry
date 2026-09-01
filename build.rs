@@ -6,6 +6,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/windows/clipferry.rc");
+    println!("cargo:rerun-if-changed=assets/windows/clipferry.manifest");
     println!("cargo:rerun-if-changed=assets/brand/clipferry.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 

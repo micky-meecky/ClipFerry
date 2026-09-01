@@ -475,11 +475,19 @@ impl ProductSession {
                     self.last_clipboard_sequence = Some(sequence);
                 }
                 if let Err(error) = self.publish_paths(&paths) {
-                    self.set_error(format!("本机文件清单发布失败：{error}"));
+                    let message = format!("本机文件清单发布失败：{error}");
+                    if error.kind() == io::ErrorKind::Unsupported {
+                        self.set_background_error(message);
+                    } else {
+                        self.set_error(message);
+                    }
                 }
             }
             Ok(ClipboardCapture::Rejected(reason)) => {
-                self.set_error(format!("本机文件剪贴板未发送：{}", reason.user_message()));
+                self.set_background_error(format!(
+                    "本机文件剪贴板未发送：{}",
+                    reason.user_message()
+                ));
             }
             Ok(ClipboardCapture::NotFileClipboard | ClipboardCapture::PrivateOffer) => {}
             Err(error) => self.set_error(format!("读取本机剪贴板失败：{error}")),
@@ -487,13 +495,16 @@ impl ProductSession {
     }
 
     fn publish_paths(&mut self, paths: &[std::path::PathBuf]) -> io::Result<()> {
-        let tree = FileTreeSnapshot::capture(paths).map_err(|error| {
-            let message = match error {
-                CaptureError::Rejected(CaptureRejection::AlternateDataStream) =>
-                    "所选内容包含 NTFS 附加数据流（通常是 Windows 的下载来源标记）。当前虚拟粘贴无法在目标端安全保留该标记，因此已停止发送；请先确认来源并在文件属性中解除锁定后重试。".to_owned(),
-                other => other.to_string(),
-            };
-            io::Error::other(message)
+        let tree = FileTreeSnapshot::capture(paths).map_err(|error| match error {
+            CaptureError::Rejected(reason) => {
+                let message = if reason == CaptureRejection::AlternateDataStream {
+                    "所选内容包含 NTFS 附加数据流（通常是 Windows 的下载来源标记）。当前虚拟粘贴无法在目标端安全保留该标记，因此已停止发送；请先确认来源并在文件属性中解除锁定后重试。"
+                } else {
+                    reason.user_message()
+                };
+                io::Error::new(io::ErrorKind::Unsupported, message)
+            }
+            CaptureError::Windows(error) => io::Error::other(error),
         })?;
         let offer = self
             .registry
@@ -815,9 +826,17 @@ impl ProductSession {
     }
 
     fn set_error(&self, error: String) {
+        self.record_error(error);
+        let _ = crate::tray::show_runtime_error_existing();
+    }
+
+    fn set_background_error(&self, error: String) {
+        self.record_error(error);
+    }
+
+    fn record_error(&self, error: String) {
         let _ = append_product_log(&self.log_path, &format!("product_error error={error}"));
         self.update_snapshot(|snapshot| snapshot.last_error = Some(error));
-        let _ = crate::tray::show_runtime_error_existing();
     }
 
     fn update_snapshot(&self, update: impl FnOnce(&mut ProductSnapshot)) {
