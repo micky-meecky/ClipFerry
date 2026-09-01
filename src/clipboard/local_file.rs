@@ -1,4 +1,5 @@
-use std::ffi::{OsString, c_void};
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStringExt as _;
@@ -10,19 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_UNEXPECTED, ERROR_FILE_INVALID, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_MORE_DATA, ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, FILETIME, HANDLE, HGLOBAL, HWND,
+    E_INVALIDARG, E_UNEXPECTED, ERROR_FILE_INVALID, ERROR_TIMEOUT, FILETIME, HANDLE, HGLOBAL, HWND,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_EA, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_INTEGRITY_STREAM,
-    FILE_ATTRIBUTE_NO_SCRUB_DATA, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_PINNED,
-    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_UNPINNED,
-    FILE_ATTRIBUTE_VIRTUAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO, FILE_TYPE_DISK,
-    FileStreamInfo, GetFileAttributesW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetFileType, INVALID_FILE_ATTRIBUTES,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileAttributesW, GetFileInformationByHandle, GetFileType,
+    INVALID_FILE_ATTRIBUTES,
 };
 use windows::Win32::System::Com::CoCreateGuid;
 use windows::Win32::System::DataExchange::{
@@ -83,13 +79,6 @@ pub enum CaptureRejection {
     InvalidPath,
     NonUnicodeName,
     Directory,
-    ReparsePoint,
-    Encrypted,
-    Sparse,
-    OfflinePlaceholder,
-    Compressed,
-    AlternateDataStream,
-    UnsupportedMetadata,
     NonDiskFile,
 }
 
@@ -107,13 +96,6 @@ impl CaptureRejection {
             Self::InvalidPath => "剪贴板中包含无效或不完整的文件路径。",
             Self::NonUnicodeName => "文件名无法用 Windows Unicode 路径表示。",
             Self::Directory => "当前操作不支持直接读取这个目录。",
-            Self::ReparsePoint => "所选内容包含符号链接、联接点或其他重解析点。",
-            Self::Encrypted => "所选内容包含 EFS 加密文件。",
-            Self::Sparse => "所选内容包含稀疏文件。",
-            Self::OfflinePlaceholder => "所选内容包含脱机或仅联机的云占位文件。",
-            Self::Compressed => "所选内容包含当前策略不支持的压缩文件。",
-            Self::AlternateDataStream => "所选内容包含 NTFS 附加数据流。",
-            Self::UnsupportedMetadata => "所选内容包含当前无法安全保留的文件元数据。",
             Self::NonDiskFile => "所选内容不是本机磁盘上的普通文件。",
         }
     }
@@ -130,13 +112,6 @@ impl fmt::Display for CaptureRejection {
             Self::InvalidPath => "invalid-path",
             Self::NonUnicodeName => "non-unicode-name",
             Self::Directory => "directory",
-            Self::ReparsePoint => "reparse-point",
-            Self::Encrypted => "efs-encrypted",
-            Self::Sparse => "sparse-file",
-            Self::OfflinePlaceholder => "offline-or-cloud-placeholder",
-            Self::Compressed => "compressed-file",
-            Self::AlternateDataStream => "alternate-data-stream",
-            Self::UnsupportedMetadata => "unsupported-file-metadata",
             Self::NonDiskFile => "non-disk-file",
         };
         formatter.write_str(text)
@@ -305,7 +280,7 @@ const fn size_of<T>() -> usize {
     std::mem::size_of::<T>()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FileIdentity {
     volume_serial: u32,
     file_index: u64,
@@ -367,18 +342,6 @@ impl FileSnapshot {
         if file_type != FILE_TYPE_DISK {
             return Err(CaptureError::Rejected(CaptureRejection::NonDiskFile));
         }
-        // Directories never expose FILECONTENTS. Some Windows volumes reject
-        // FileStreamInfo for directory handles with E_INVALIDARG, so querying
-        // them both breaks otherwise valid trees and provides no content
-        // protection. Every ordinary child file is still checked here and
-        // again when its stable content handle is opened.
-        let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-        if !is_directory && has_named_data_stream(&file).map_err(CaptureError::Windows)? {
-            return Err(CaptureError::Rejected(
-                CaptureRejection::AlternateDataStream,
-            ));
-        }
-
         Ok(Self::from_information(
             path.to_path_buf(),
             virtual_path,
@@ -424,7 +387,7 @@ impl FileSnapshot {
         VirtualFileDescriptor {
             file_name: Arc::clone(&self.file_name),
             size: self.size,
-            attributes: self.attributes,
+            attributes: transferable_attributes(self.attributes),
             creation_time: Some(self.creation_time),
             last_access_time: Some(self.last_access_time),
             last_write_time: Some(self.last_write_time),
@@ -432,11 +395,10 @@ impl FileSnapshot {
     }
 
     fn matches(&self, information: &BY_HANDLE_FILE_INFORMATION) -> bool {
-        self.size == file_size(information)
-            && self.attributes == information.dwFileAttributes
-            && self.identity == file_identity(information)
-            && filetime_eq(self.creation_time, information.ftCreationTime)
-            && filetime_eq(self.last_write_time, information.ftLastWriteTime)
+        // The path must still name the same file and its advertised size must remain valid. Attribute
+        // and timestamp changes are intentionally tolerated: adding an ADS, hydrating a cloud file,
+        // or changing ordinary metadata must not turn a valid copy into a policy failure.
+        self.size == file_size(information) && self.identity == file_identity(information)
     }
 }
 
@@ -473,6 +435,7 @@ impl FileTreeSnapshot {
         }
         let mut entries = Vec::new();
         let mut total_path_units = 0_usize;
+        let mut active_directories = HashSet::new();
         for path in paths {
             if !path.is_absolute() {
                 return Err(CaptureError::Rejected(CaptureRejection::InvalidPath));
@@ -482,7 +445,14 @@ impl FileTreeSnapshot {
                 .and_then(|name| name.to_str())
                 .ok_or(CaptureError::Rejected(CaptureRejection::NonUnicodeName))?;
             validate_virtual_file_name(root_name).map_err(CaptureError::Windows)?;
-            capture_tree_entry(path, root_name, 0, &mut entries, &mut total_path_units)?;
+            capture_tree_entry(
+                path,
+                root_name,
+                0,
+                &mut entries,
+                &mut total_path_units,
+                &mut active_directories,
+            )?;
         }
         let descriptors: Vec<VirtualFileDescriptor> =
             entries.iter().map(FileSnapshot::descriptor).collect();
@@ -535,6 +505,7 @@ fn capture_tree_entry(
     depth: usize,
     entries: &mut Vec<FileSnapshot>,
     total_path_units: &mut usize,
+    active_directories: &mut HashSet<FileIdentity>,
 ) -> std::result::Result<(), CaptureError> {
     if depth >= MAX_VIRTUAL_DEPTH {
         return Err(CaptureError::Rejected(CaptureRejection::TreeTooDeep));
@@ -547,8 +518,15 @@ fn capture_tree_entry(
         return Err(CaptureError::Rejected(CaptureRejection::ManifestTooLarge));
     }
     let is_directory = snapshot.is_directory();
+    let identity = snapshot.identity;
     entries.push(snapshot);
     if !is_directory {
+        return Ok(());
+    }
+    if !active_directories.insert(identity) {
+        // A junction or symbolic link points back into the active recursion chain. Preserve the
+        // directory entry as an empty boundary and stop walking, matching the content-first policy
+        // without allowing an infinite tree.
         return Ok(());
     }
 
@@ -578,8 +556,10 @@ fn capture_tree_entry(
             depth + 1,
             entries,
             total_path_units,
+            active_directories,
         )?;
     }
+    active_directories.remove(&identity);
     Ok(())
 }
 
@@ -594,57 +574,27 @@ fn reject_attributes_for_capture(
     if !allow_directory && attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
         return Err(CaptureRejection::Directory);
     }
-    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Err(CaptureRejection::ReparsePoint);
-    }
-    if attributes & FILE_ATTRIBUTE_ENCRYPTED.0 != 0 {
-        return Err(CaptureRejection::Encrypted);
-    }
-    if attributes & FILE_ATTRIBUTE_SPARSE_FILE.0 != 0 {
-        return Err(CaptureRejection::Sparse);
-    }
-    if attributes
-        & (FILE_ATTRIBUTE_OFFLINE.0
-            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0
-            | FILE_ATTRIBUTE_RECALL_ON_OPEN.0)
-        != 0
-    {
-        return Err(CaptureRejection::OfflinePlaceholder);
-    }
-    if attributes & FILE_ATTRIBUTE_COMPRESSED.0 != 0 {
-        return Err(CaptureRejection::Compressed);
-    }
-    if attributes
-        & (FILE_ATTRIBUTE_EA.0
-            | FILE_ATTRIBUTE_INTEGRITY_STREAM.0
-            | FILE_ATTRIBUTE_NO_SCRUB_DATA.0
-            | FILE_ATTRIBUTE_PINNED.0
-            | FILE_ATTRIBUTE_UNPINNED.0
-            | FILE_ATTRIBUTE_VIRTUAL.0)
-        != 0
-    {
-        return Err(CaptureRejection::UnsupportedMetadata);
-    }
     Ok(())
 }
 
 fn open_snapshot_handle(path: &Path) -> Result<File> {
-    open_file(
+    open_file_with_flags(
         path,
         FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0,
+        FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_NO_RECALL.0,
     )
 }
 
 fn open_stable_handle(path: &Path) -> Result<File> {
-    open_file(path, FILE_SHARE_READ.0)
+    open_file_with_flags(path, FILE_SHARE_READ.0, FILE_FLAG_BACKUP_SEMANTICS.0)
 }
 
-fn open_file(path: &Path, share_mode: u32) -> Result<File> {
+fn open_file_with_flags(path: &Path, share_mode: u32, flags: u32) -> Result<File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .share_mode(share_mode)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0);
+        .custom_flags(flags);
     options.open(path).map_err(|error| io_error(&error))
 }
 
@@ -670,89 +620,18 @@ fn file_identity(information: &BY_HANDLE_FILE_INFORMATION) -> FileIdentity {
     }
 }
 
-fn filetime_eq(left: FILETIME, right: FILETIME) -> bool {
-    left.dwLowDateTime == right.dwLowDateTime && left.dwHighDateTime == right.dwHighDateTime
-}
-
-fn has_named_data_stream(file: &File) -> Result<bool> {
-    // Query by the already-validated handle so a rename/replacement race cannot
-    // make the ADS policy inspect a different path target.
-    const BUFFER_SIZE: usize = 64 * 1024;
-    const NAME_OFFSET: usize = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
-    if let Err(error) = unsafe {
-        GetFileInformationByHandleEx(
-            file_handle(file),
-            FileStreamInfo,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            u32::try_from(buffer.len()).expect("the fixed stream-info buffer fits in u32"),
-        )
-    } {
-        if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) {
-            return Ok(false);
-        }
-        if error.code() == HRESULT::from_win32(ERROR_MORE_DATA.0)
-            || error.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
-        {
-            // A default unnamed stream fits in a few dozen bytes. Overflow is
-            // therefore already enough evidence to conservatively reject.
-            return Ok(true);
-        }
-        return Err(error);
-    }
-
-    let mut cursor = 0_usize;
-    loop {
-        let header_end = cursor
-            .checked_add(NAME_OFFSET)
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-        let structure_end = cursor
-            .checked_add(size_of::<FILE_STREAM_INFO>())
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-        if header_end > buffer.len() || structure_end > buffer.len() {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let entry = unsafe {
-            buffer
-                .as_ptr()
-                .add(cursor)
-                .cast::<FILE_STREAM_INFO>()
-                .read_unaligned()
-        };
-        let name_bytes = usize::try_from(entry.StreamNameLength)
-            .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-        if name_bytes % size_of::<u16>() != 0 {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let entry_end = header_end
-            .checked_add(name_bytes)
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-        if entry_end > buffer.len() {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let name_length = name_bytes / size_of::<u16>();
-        let mut name = Vec::with_capacity(name_length);
-        for index in 0..name_length {
-            let character_offset = header_end + index * size_of::<u16>();
-            name.push(u16::from_ne_bytes([
-                buffer[character_offset],
-                buffer[character_offset + 1],
-            ]));
-        }
-        if String::from_utf16_lossy(&name) != "::$DATA" {
-            return Ok(true);
-        }
-        if entry.NextEntryOffset == 0 {
-            return Ok(false);
-        }
-        let next = usize::try_from(entry.NextEntryOffset)
-            .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-        if next < NAME_OFFSET {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        cursor = cursor
-            .checked_add(next)
-            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+fn transferable_attributes(attributes: u32) -> u32 {
+    let basic = attributes
+        & (FILE_ATTRIBUTE_ARCHIVE.0
+            | FILE_ATTRIBUTE_HIDDEN.0
+            | FILE_ATTRIBUTE_READONLY.0
+            | FILE_ATTRIBUTE_SYSTEM.0);
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        basic | FILE_ATTRIBUTE_DIRECTORY.0
+    } else if basic == 0 {
+        FILE_ATTRIBUTE_NORMAL.0
+    } else {
+        basic
     }
 }
 
@@ -791,17 +670,11 @@ impl StableFileContext {
     fn open(snapshot: Arc<FileSnapshot>) -> Result<Self> {
         let file = open_stable_handle(&snapshot.path)?;
         let information = information_for(&file)?;
-        reject_attributes(information.dwFileAttributes)
-            .map_err(|_| Error::from_hresult(HRESULT::from_win32(ERROR_NOT_SUPPORTED.0)))?;
+        reject_attributes(information.dwFileAttributes).map_err(|_| source_changed_error())?;
         if unsafe { GetFileType(file_handle(&file)) } != FILE_TYPE_DISK
             || !snapshot.matches(&information)
         {
             return Err(source_changed_error());
-        }
-        if has_named_data_stream(&file)? {
-            return Err(Error::from_hresult(HRESULT::from_win32(
-                ERROR_NOT_SUPPORTED.0,
-            )));
         }
         Ok(Self { file, snapshot })
     }
@@ -1113,9 +986,9 @@ mod tests {
 
     use windows::Win32::Foundation::{ERROR_FILE_INVALID, ERROR_TIMEOUT};
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
-        FILE_ATTRIBUTE_INTEGRITY_STREAM, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_SPARSE_FILE,
+        FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_INTEGRITY_STREAM, FILE_ATTRIBUTE_OFFLINE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
     };
     use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE};
     use windows::core::HRESULT;
@@ -1123,7 +996,7 @@ mod tests {
     use super::{
         CaptureError, CaptureRejection, FileSnapshot, FileTreeSnapshot, LocalOfferRegistry,
         PRIVATE_ORIGIN_PREFIX, StableFileSource, is_private_origin_payload, reject_attributes,
-        validate_drop_effect,
+        transferable_attributes, validate_drop_effect,
     };
     use crate::clipboard::source::ReadAtSource;
 
@@ -1155,36 +1028,81 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_attribute_policy_is_explicit() {
+    fn content_first_attribute_policy_only_rejects_a_direct_file_directory_mismatch() {
         assert_eq!(
             reject_attributes(FILE_ATTRIBUTE_DIRECTORY.0),
             Err(CaptureRejection::Directory)
         );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_REPARSE_POINT.0),
-            Err(CaptureRejection::ReparsePoint)
-        );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_ENCRYPTED.0),
-            Err(CaptureRejection::Encrypted)
-        );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_SPARSE_FILE.0),
-            Err(CaptureRejection::Sparse)
-        );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_OFFLINE.0),
-            Err(CaptureRejection::OfflinePlaceholder)
-        );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_COMPRESSED.0),
-            Err(CaptureRejection::Compressed)
-        );
-        assert_eq!(
-            reject_attributes(FILE_ATTRIBUTE_INTEGRITY_STREAM.0),
-            Err(CaptureRejection::UnsupportedMetadata)
-        );
+        for attributes in [
+            FILE_ATTRIBUTE_REPARSE_POINT.0,
+            FILE_ATTRIBUTE_ENCRYPTED.0,
+            FILE_ATTRIBUTE_SPARSE_FILE.0,
+            FILE_ATTRIBUTE_OFFLINE.0,
+            FILE_ATTRIBUTE_COMPRESSED.0,
+            FILE_ATTRIBUTE_INTEGRITY_STREAM.0,
+        ] {
+            assert_eq!(reject_attributes(attributes), Ok(()));
+        }
         assert_eq!(reject_attributes(0), Ok(()));
+        assert_eq!(
+            transferable_attributes(
+                FILE_ATTRIBUTE_ARCHIVE.0
+                    | FILE_ATTRIBUTE_REPARSE_POINT.0
+                    | FILE_ATTRIBUTE_ENCRYPTED.0
+                    | FILE_ATTRIBUTE_SPARSE_FILE.0
+                    | FILE_ATTRIBUTE_OFFLINE.0
+                    | FILE_ATTRIBUTE_COMPRESSED.0
+                    | FILE_ATTRIBUTE_INTEGRITY_STREAM.0
+            ),
+            FILE_ATTRIBUTE_ARCHIVE.0
+        );
+    }
+
+    #[test]
+    fn symbolic_file_link_is_flattened_to_its_main_content() {
+        let owner = TestFile::create("target.bin", b"linked payload");
+        let link = owner.directory.join("link.bin");
+        if let Err(error) = std::os::windows::fs::symlink_file(&owner.path, &link) {
+            eprintln!("symbolic-link test unavailable: {error}");
+            return;
+        }
+
+        let snapshot = FileSnapshot::capture(&link).unwrap();
+        assert_eq!(snapshot.file_name().as_ref(), "link.bin");
+        assert_eq!(snapshot.size(), 14);
+        let source = StableFileSource::new(
+            Arc::new(snapshot),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let mut bytes = [0_u8; 14];
+        assert_eq!(source.read_at(0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"linked payload");
+    }
+
+    #[test]
+    fn symbolic_directory_cycle_is_kept_as_an_empty_boundary() {
+        let owner = TestFile::create("anchor.tmp", b"");
+        let root = owner.directory.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("payload.bin"), b"payload").unwrap();
+        let loop_link = root.join("loop");
+        if let Err(error) = std::os::windows::fs::symlink_dir(&root, &loop_link) {
+            eprintln!("symbolic-link test unavailable: {error}");
+            return;
+        }
+
+        let tree = FileTreeSnapshot::capture(std::slice::from_ref(&root)).unwrap();
+        let names: Vec<&str> = tree
+            .entries()
+            .iter()
+            .map(|entry| entry.file_name.as_ref())
+            .collect();
+        assert_eq!(tree.directory_count(), 2);
+        assert_eq!(tree.file_count(), 1);
+        assert!(names.contains(&"root\\loop"));
+        assert!(!names.iter().any(|name| name.contains("loop\\loop")));
+
+        std::fs::remove_dir(&loop_link).unwrap();
     }
 
     #[test]
@@ -1312,23 +1230,21 @@ mod tests {
     }
 
     #[test]
-    fn alternate_data_stream_is_rejected() {
+    fn alternate_data_stream_is_ignored_while_the_main_stream_is_captured() {
         let file = TestFile::create("motw.bin", b"payload");
         let stream_path =
             std::path::PathBuf::from(format!("{}:Zone.Identifier", file.path.display()));
         match std::fs::write(&stream_path, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
-            Ok(()) => assert!(matches!(
-                FileSnapshot::capture(&file.path),
-                Err(CaptureError::Rejected(
-                    CaptureRejection::AlternateDataStream
-                ))
-            )),
+            Ok(()) => {
+                let snapshot = FileSnapshot::capture(&file.path).unwrap();
+                assert_eq!(snapshot.size(), 7);
+            }
             Err(error) => eprintln!("ADS test not supported on this volume: {error}"),
         }
     }
 
     #[test]
-    fn alternate_data_stream_added_after_capture_is_rejected_before_content() {
+    fn alternate_data_stream_added_after_capture_does_not_block_main_content() {
         let file = TestFile::create("late-motw.bin", b"payload");
         let snapshot = FileSnapshot::capture(&file.path).unwrap();
         let stream_path =
@@ -1342,9 +1258,10 @@ mod tests {
         );
         let mut bytes = [0_u8; 8];
 
-        assert!(source.read_at(0, &mut bytes).is_err());
+        assert_eq!(source.read_at(0, &mut bytes).unwrap(), 7);
+        assert_eq!(&bytes[..7], b"payload");
         assert_eq!(source.read_calls(), 1);
-        assert_eq!(source.bytes_read(), 0);
+        assert_eq!(source.bytes_read(), 7);
     }
 
     #[test]
