@@ -1,143 +1,231 @@
 <p align="center">
-  <img src="./assets/brand/clipferry-icon-generated.png" width="196" alt="ClipFerry logo">
+  <img src="./assets/brand/clipferry-icon-512.png" width="176" alt="ClipFerry logo">
 </p>
 
 <h1 align="center">ClipFerry</h1>
 
 <p align="center">
-  <strong>剪贴摆渡 · 在一台 Windows 电脑复制，在另一台直接粘贴。</strong><br>
-  文件内容在你按下 <code>Ctrl+V</code> 时才通过局域网流式传输。
+  <strong>Copy on one Windows PC. Paste on the other.</strong><br>
+  Lightweight, convenient, and quietly out of your way.
 </p>
 
 <p align="center">
-  <a href="#项目简介">项目简介</a> ·
-  <a href="#工作方式">工作方式</a> ·
-  <a href="#当前状态">当前状态</a> ·
-  <a href="#实施路线">实施路线</a> ·
-  <a href="#安全边界">安全边界</a>
+  <strong>English</strong> · <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
+  <a href="#why-clipferry">Why ClipFerry</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#everyday-use">Everyday use</a> ·
+  <a href="#security-and-privacy">Security</a> ·
+  <a href="#support-the-project">Support</a>
+</p>
+
+<p align="center">
+  <img alt="Version: 0.1.4" src="https://img.shields.io/badge/version-0.1.4-278AC4?style=flat-square">
   <img alt="Platform: Windows 10 and 11 x64" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-080C42?style=flat-square">
   <img alt="Language: Rust" src="https://img.shields.io/badge/language-Rust-278AC4?style=flat-square">
-  <img alt="Stage: Technical validation" src="https://img.shields.io/badge/stage-technical%20validation-55AEDA?style=flat-square">
   <img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-DCE5EF?style=flat-square&amp;labelColor=080C42">
 </p>
 
-## 项目简介
+## Why ClipFerry
 
-**ClipFerry（剪贴摆渡）** 是一个面向 Windows 10/11 x64 的原生局域网文件剪贴板工具。
+Using two computers should not make moving a file feel like a separate job. Keyboard and mouse movement can be handled by Microsoft PowerToys Mouse Without Borders, but its built-in file copy supports only one file at a time and has a 100 MB limit. Folders, multiple selections, and larger files still need another route.
 
-设想中的使用方式很简单：在电脑 A 的资源管理器中选中文件并按 `Ctrl+C`，然后在电脑 B 的任意目录按 `Ctrl+V`。复制时只同步文件清单；真正粘贴时，电脑 B 才从电脑 A 按需读取文件内容。
+ClipFerry focuses on that one missing piece:
 
-ClipFerry 希望保留用户已经熟悉的 Windows 复制粘贴体验，不安装系统驱动，不拦截全局快捷键，也不要求用户在自定义文件管理器里完成传输。
+1. Select files or folders in File Explorer on computer A and press `Ctrl+C`.
+2. Move to computer B and press `Ctrl+V` in the destination folder.
+3. ClipFerry transfers the content over the local network while File Explorer shows its normal copy progress.
 
-> [!IMPORTANT]
-> ClipFerry 目前处于架构设计与本地技术验证准备阶段。仓库尚无可用程序、Release 或已验证的性能数据，请勿将本文描述视为已经交付的功能。
+There is no cloud upload, no custom file manager, and no new transfer workflow to learn.
 
-## 工作方式
+### Lightweight
+
+- One native Windows executable, with no bundled Electron, WebView, database, or separate runtime.
+- The 0.1.4 release build is about 2.8 MiB and can run directly from any folder.
+- Bounded, streaming reads avoid loading an entire large file into memory before sending it.
+
+### Convenient
+
+- Run it on both computers, discover the peer automatically, and confirm the first pairing on both sides.
+- Keep using File Explorer and the familiar `Ctrl+C` / `Ctrl+V` workflow.
+- Copy a single file, multiple files, or complete folders in either direction.
+- View progress and pause, resume, or cancel a receiving transfer from the tray.
+
+### Quiet
+
+- Lives in the Windows notification area without taking focus or keeping a main window open.
+- Copying publishes only a file manifest; file content moves only when the other computer actually pastes it.
+- Can start with Windows and remain unnoticed until it is needed.
+
+## Quick start
+
+### 1. Prepare both computers
+
+- Windows 10 or Windows 11, x64.
+- Both computers connected to the same trusted local network. Setting that Windows network profile to **Private** is recommended.
+- The same version of `clipferry.exe` on both computers.
+
+ClipFerry handles the file clipboard. To move your keyboard and mouse between the two computers, install [Microsoft PowerToys](https://learn.microsoft.com/windows/powertoys/install) on both and enable [Mouse Without Borders](https://learn.microsoft.com/windows/powertoys/mouse-without-borders).
+
+### 2. Set up Mouse Without Borders
+
+1. Open PowerToys Settings on both computers and enable **Mouse Without Borders**.
+2. Generate a security key on the first computer, then enter that key and the first computer's device name on the second.
+3. Arrange the device tiles in PowerToys to match the physical placement of the two screens.
+4. On both computers, disable **Share clipboard** and **Transfer file**. This leaves keyboard and mouse movement to Mouse Without Borders while ClipFerry remains the only program managing the Windows file clipboard.
+5. If it does not connect, confirm that both machines are on the same network, check the firewall, and use **Refresh connections** as described in Microsoft's documentation.
+
+> Mouse Without Borders is part of Microsoft PowerToys. Refer to Microsoft's documentation for its installation, permissions, security key, and connection troubleshooting.
+
+### 3. Start ClipFerry
+
+1. Put `clipferry.exe` on both computers. Installation and administrator privileges are not required.
+2. Double-click `clipferry.exe` on both computers.
+3. If Windows Firewall asks for permission on first launch, allow ClipFerry only on trusted **Private networks**.
+4. Find the ClipFerry icon in the notification area. Windows may place it under the `^` hidden-icons button.
+
+### 4. Pair once
+
+1. Keep ClipFerry running on both computers and allow a few seconds for local discovery.
+2. Right-click the tray icon on either computer and select **配对新设备…** (Pair new device).
+3. Select the other computer and check its device name and address.
+4. Both computers display a verification code and device fingerprint. Confirm only when the verification codes match exactly.
+5. After both sides approve, ClipFerry saves the trusted device and current LAN route and enables automatic receiving.
+6. Double-click the tray icon, or select **查看状态** (View status), and confirm that the peer is online.
+
+You do not need to pair again during normal future launches.
+
+## Everyday use
+
+### Copy from computer A to computer B
+
+1. In File Explorer on computer A, select one or more files or folders.
+2. Press `Ctrl+C`.
+3. Use Mouse Without Borders to move the keyboard and mouse to computer B.
+4. Open the destination folder on computer B and press `Ctrl+V`.
+5. Let File Explorer finish the copy. Keep computer A awake and connected, and keep the source files available until the transfer completes.
+
+To copy in the other direction, repeat the same steps with the computers reversed.
+
+### Tray menu reference
+
+The 0.1.4 tray menu is currently displayed in Chinese:
+
+| Menu item | Purpose |
+| --- | --- |
+| 查看状态 | View the local identity, trusted peer, connection, latest manifest, and transfer state |
+| 配对新设备… | Discover and pair another ClipFerry computer |
+| 管理已配对设备… | List trusted computers or revoke a pairing |
+| 高级连接设置… | Manually select a peer and addresses for unusual network setups |
+| 接收待确认的文件剪贴板 | Accept a pending manifest when automatic receiving is disabled |
+| 显示传输窗口 | View file count, byte progress, speed, and current state |
+| 暂停 / 继续 / 取消传输 | Pause, resume, or cancel the active receiving transfer |
+| 随 Windows 启动 | Toggle startup for the current Windows user |
+| 打开诊断日志 | Open the diagnostic log for discovery, connection, or transfer issues |
+| 退出 ClipFerry | Stop ClipFerry cleanly |
+
+## How it works
 
 ```mermaid
 sequenceDiagram
-    participant A as 电脑 A
+    participant A as Computer A
     participant FA as ClipFerry A
     participant FB as ClipFerry B
-    participant B as 电脑 B
+    participant B as Computer B
 
-    A->>FA: 在资源管理器按 Ctrl+C
-    FA->>FB: 发送已授权的文件清单
-    Note over FA,FB: 此时不传输文件内容
-    FB->>B: 注册 Windows 虚拟文件剪贴板
-    B->>FB: 在目标目录按 Ctrl+V
-    FB->>FA: 按偏移请求文件内容
-    FA-->>FB: 加密流式返回数据块
-    FB-->>B: 通过 IStream 交给资源管理器
+    A->>FA: Copy in File Explorer
+    FA->>FB: Publish the authorized file manifest
+    Note over FA,FB: File content has not moved yet
+    FB->>B: Register a Windows virtual file clipboard
+    B->>FB: Paste in the destination folder
+    FB->>FA: Request content ranges on demand
+    FA-->>FB: Return encrypted data chunks
+    FB-->>B: Stream content to File Explorer through IStream
 ```
 
-核心实现路线是 Windows Shell 虚拟文件剪贴板：B 通过 `IDataObject` 提供 `FILEGROUPDESCRIPTORW` 和 `FILECONTENTS`，每个文件内容由 `IStream` 按需读取。网络层采用范围读取，以支持资源管理器可能出现的 Seek、重试、乱序或重复请求。
+ClipFerry uses the Windows Shell virtual-file clipboard. The receiving side exposes `FILEGROUPDESCRIPTORW` and `FILECONTENTS` through `IDataObject`, then supplies content on demand through `IStream` when File Explorer reads it. Range-based network reads support seeks, short reads, retries, and bounded memory without first creating a full temporary copy.
 
-## 设计原则
+## Security and privacy
 
-- **粘贴才传输**：`Ctrl+C` 阶段不预读或上传完整文件。
-- **原生粘贴语义**：不全局拦截 `Ctrl+V`，不猜测资源管理器目标目录。
-- **轻量常驻**：以原生 Win32/COM 和 Rust 为首选，不引入 Electron、WebView 或数据库。
-- **取消优先**：取消是 MVP 必备能力；暂停/继续只有通过 Explorer 兼容性实测后才正式提供。
-- **默认安全**：真实双机文件测试前必须具备认证和加密，远端只能读取本次清单明确授权的文件。
-- **诚实验证**：所有兼容性、资源占用和传输结果均以真实 Windows Explorer 和双机测试为准。
+- Local-network only: no cloud upload and no public relay service.
+- First pairing requires matching verification codes and approval on both computers.
+- Each computer has a persistent identity and SHA-256 fingerprint.
+- File traffic uses mutually authenticated TLS 1.3 with certificate pinning.
+- A peer can request only content explicitly authorized by the current manifest, not arbitrary local paths.
+- Incoming names are validated against path traversal, UNC paths, device names, NTFS alternate data streams, and related unsafe forms.
+- Pairing keys and transfer capabilities are not written to the normal diagnostic log.
 
-## 当前状态
+Pair only computers and networks you trust. Revoke a computer from **管理已配对设备…** (Manage paired devices) when it should no longer be trusted.
 
-当前公开仓库只有项目说明、许可证和品牌资产，尚未创建 Rust 工程，也没有可执行文件。
+## Troubleshooting
 
-| 项目 | 状态 |
-| --- | --- |
-| Windows 虚拟文件粘贴 | 未验证 |
-| `IStream` 按需读取 | 未验证 |
-| 暂停、继续与取消 | 未验证 |
-| 双机加密传输 | 未实现 |
-| Windows 10/11 兼容性 | 未验证 |
-| 空闲 CPU、内存和 EXE 体积目标 | 未验证 |
+### The other computer is not discovered
 
-首个技术验证目标是让一个并不存在于磁盘上的 `RemoteClipboard-Test.txt` 出现在 Windows 剪贴板中，并由资源管理器正确粘贴出来。
+Make sure ClipFerry is running on both computers, both are connected to the same LAN, and Windows Firewall allows ClipFerry on private networks. Wait a few seconds and open **配对新设备…** again.
 
-## 实施路线
+### A paired peer is not online
 
-- [ ] 检查 Rust、MSVC 和 Windows SDK 环境。
-- [ ] 完成本地虚拟文件剪贴板与 Explorer 生命周期验证。
-- [ ] 验证取消，以及短暂停、长暂停对 Explorer 的影响。
-- [ ] 完成本机 TCP 回环、Seek、短读、大文件和有界内存测试。
-- [ ] 捕获本机 `CF_HDROP` 并以稳定文件句柄读取真实单文件。
-- [ ] 建立 TLS 1.3 安全通道并完成双机单文件 MVP。
-- [ ] 完成持久配对、设备授权、重放防护和完整性方案。
-- [ ] 支持多文件、文件夹、重名、断线恢复、托盘和自启动。
-- [ ] 完成 Windows 10/11 双机 Release 验收。
+Confirm that the other computer is awake and still running ClipFerry. Normal home networks refresh a discovered peer's current route automatically. For a VPN, multiple virtual adapters, or an unusual route, use **高级连接设置…** only after checking the automatic setup.
 
-每个阶段都必须留下可复现命令、日志和实际资源管理器结果。失败时先定位 Shell/COM、协议或文件系统根因，不用绕开原生粘贴语义的方式掩盖问题。
+### Copying does not update the other computer's file clipboard
 
-## 暂停与取消
+Open **查看状态** and verify that the active peer is online and automatic receiving is enabled. If automatic receiving is disabled, select **接收待确认的文件剪贴板**.
 
-传输状态计划采用：
+### PowerToys shows its own file-transfer notification
+
+Disable **Share clipboard** and **Transfer file** in Mouse Without Borders on both computers. ClipFerry should own the file clipboard; Mouse Without Borders should handle only keyboard and mouse movement.
+
+### Interaction with an elevated application does not work
+
+That behavior is controlled by Mouse Without Borders, not by ClipFerry's file transfer. Microsoft documents administrator and service-mode options for interacting with elevated applications; read its security warning before enabling service mode.
+
+## Build from source
+
+Building requires stable Rust, the Visual Studio 2022 C++ build tools, and a Windows 10/11 SDK.
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
+```
+
+The release executable is written to:
 
 ```text
-准备 → 传输中 ⇄ 已暂停 → 已完成 / 已取消 / 失败
+target\x86_64-pc-windows-msvc\release\clipferry.exe
 ```
 
-取消必须能唤醒所有等待中的读取、停止新范围请求、关闭数据连接并释放源文件句柄。暂停则会在数据块边界停止新请求，并保留每个流的当前位置。
+## About the author
 
-Windows Explorer 是否允许同一次虚拟文件粘贴长时间阻塞后继续，目前尚未验证。因此首版可以只承诺取消；暂停按钮只有在 5 秒、60 秒和 10 分钟兼容性测试均通过后才会启用。
+ClipFerry is developed and maintained by **micky-meecky**. It began with a simple wish: make two useful Windows computers feel like one practical workspace without routing files through heavy remote-desktop software, screen casting, or the cloud. Mouse Without Borders solved keyboard and mouse movement well, but its file-transfer limit left a gap. ClipFerry was built as a small, native companion dedicated to moving files through the ordinary Windows clipboard.
 
-## 安全边界
+## Support the project
 
-- 真实文件不会通过未认证、未加密的局域网连接传输。
-- Offer 和 Transfer 必须绑定目标设备、有效期和高熵能力标识。
-- 对端只能提交 `file_id`，不能请求任意本地路径。
-- B 会独立验证远端文件名，拒绝路径穿越、UNC、设备名和 NTFS ADS 等危险形式。
-- A 通过同一已验证文件句柄提供内容，避免一次传输混合不同文件版本。
-- EFS、重解析点、MOTW/ADS 和云占位符在得到明确安全策略前不会被静默当作普通文件处理。
-- 配对、密钥和 Transfer capability 不写入普通日志。
+If ClipFerry makes your two-computer workflow a little easier, you can support its continued development with Alipay or WeChat Pay.
 
-## 目标与非目标
+<table align="center">
+  <tr>
+    <th align="center">Alipay</th>
+    <th align="center">WeChat Pay</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="./assets/support/alipay-donation.jpg" width="280" alt="Alipay donation QR code"></td>
+    <td align="center"><img src="./assets/support/wechat-pay-donation.jpg" width="280" alt="WeChat Pay donation QR code"></td>
+  </tr>
+</table>
 
-| 首版目标 | 明确不做 |
-| --- | --- |
-| Windows 10/11 x64 | 鼠标键盘共享 |
-| 同一局域网双机文件剪贴板 | 远程桌面或屏幕投送 |
-| 粘贴触发的流式传输 | 云端存储与公网中转 |
-| 普通文件，后续扩展文件夹 | 系统驱动或 Shell 扩展 |
-| 无管理员权限运行 | 全局快捷键钩子 |
-| 一个原生轻量 EXE | Electron 或完整 .NET 自包含运行时 |
+Thank you for using, sharing, or supporting ClipFerry.
 
-## 构建与安装
+## License
 
-尚未建立源码工程，因此目前没有有效的构建、安装或运行命令。第一阶段完成环境检查并创建最小 Rust 工程后，本节会更新为经过实际执行的命令。
-
-## 许可证
-
-ClipFerry 使用 [GNU General Public License v3.0](./LICENSE)，对应 SPDX 标识 `GPL-3.0-only`。你可以使用、研究、修改和分发本项目；分发本项目或其衍生版本时，需要按照 GPLv3 提供相应源代码并保留同等许可与声明。
+ClipFerry is licensed under the [GNU General Public License v3.0](./LICENSE), identified by the SPDX expression `GPL-3.0-only`. You may use, study, modify, and redistribute it under the terms of GPLv3, including the corresponding-source and same-license requirements that apply when distributing the program or a derivative work.
 
 ---
 
 <p align="center">
-  <img src="./assets/brand/clipferry-icon-generated.png" width="72" alt="ClipFerry icon"><br>
-  <sub>复制清单，粘贴启航。</sub>
+  <img src="./assets/brand/clipferry-icon-512.png" width="72" alt="ClipFerry icon"><br>
+  <sub>Copy the manifest. Paste to set sail.</sub>
 </p>
